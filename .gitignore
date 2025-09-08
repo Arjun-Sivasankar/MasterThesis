@@ -1,3 +1,11 @@
 logs/
 dataset/
 secrets.yaml
+
+## Analysis files
+icd10_analysis/
+icd9_analysis/
+
+## Runs and checkpoints
+runs_gen/
+runs_hpo/
