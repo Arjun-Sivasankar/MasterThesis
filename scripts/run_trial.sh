@@ -61,6 +61,7 @@ echo "[INFO] Starting base evaluation..."
 srun torchrun --nproc_per_node=${GPUS} gen/test/base_model_eval/eval_base_llm.py \
     --data_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/merged_icd9.pkl \
     --model meta-llama/Llama-3.2-1B-Instruct \
+    --show_prompts \
 
 # --- 7) Exit status ---
 status=$?

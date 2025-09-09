@@ -237,6 +237,11 @@ def show_examples(df: pd.DataFrame, preds: List[List[str]], n=5, seed=42):
         gold = sorted({normalize_code(c) for c in row[LABEL_COL]})
         pred = preds[i]
         print("\n" + "="*80)
+        if show_prompts and "input_text" in row:
+            print("\n----- PROMPT (FULL) -----")
+            print(row["input_text"])  # Print full prompt without truncation
+            print("----- END PROMPT -----\n")
+            
         print(f"idx={i} subject_id={row.get(SUBJECT_COL)} hadm_id={row.get('hadm_id')}")
         print("- GOLD:", " ".join(gold) if gold else "(none)")
         print("- PRED:", " ".join(pred) if pred else "(none)")
@@ -268,7 +273,7 @@ def main():
 
     ap.add_argument("--max_len", type=int, default=3072)
     ap.add_argument("--gen_max_new", type=int, default=96)
-    ap.add_argument("--gen_batch_size", type=int, default=8)
+    ap.add_argument("--gen_batch_size", type=int, default=16)
     ap.add_argument("--stop_on_double_newline", action="store_true")
     ap.add_argument("--no_stop_on_double_newline", dest="stop_on_double_newline", action="store_false")
     ap.set_defaults(stop_on_double_newline=True)
