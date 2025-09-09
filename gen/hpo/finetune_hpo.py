@@ -811,7 +811,8 @@ def objective(trial):
     
     # Sample hyperparameters
     params = define_search_space(trial, args)
-    rank0_print(f"\n=== Starting Trial #{trial.number} ===")
+    print("\n")
+    rank0_print(f"=== Starting Trial #{trial.number} ===")
     rank0_print(f"Parameters: {params}")
     
     # Report disk usage before trial

@@ -9,3 +9,4 @@ icd9_analysis/
 ## Runs and checkpoints
 runs_gen/
 runs_hpo/
+runs_base_eval_fast/

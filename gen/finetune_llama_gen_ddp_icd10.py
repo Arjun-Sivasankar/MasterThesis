@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Generative ICD-9 code prediction with LoRA (DDP-safe, epoch timing, optimized generation)
+Generative ICD-10 code prediction with LoRA (DDP-safe, epoch timing, optimized generation)
 
 - Rank detection works BEFORE DDP init (uses LOCAL_RANK/RANK env)
 - Enhanced timing logs with timestamps at appropriate points
@@ -96,10 +96,10 @@ def get_args():
     ap.add_argument("--train_pickle", default=None)
     ap.add_argument("--val_pickle", default=None)
     ap.add_argument("--test_pickle", default=None)
-    ap.add_argument("--icd9_pickle", default="MasterThesis/dataset/codes/icd9.pkl", help="Path to complete ICD-9 code list")
+    ap.add_argument("--icd10_pickle", default="MasterThesis/dataset/codes/icd10.pkl", help="Path to complete ICD-10 code list")
     ap.add_argument("--subject_col", default="subject_id_x")
     ap.add_argument("--label_col", default="icd_code")
-    ap.add_argument("--use_complete_icd9", type=int, default=1)
+    ap.add_argument("--use_complete_icd10", type=int, default=1)
 
     # model/prompt
     ap.add_argument("--llama_model", default="meta-llama/Llama-3.2-1B-Instruct")
@@ -126,7 +126,7 @@ def get_args():
     ap.add_argument("--seed", type=int, default=42)
 
     # run dirs
-    ap.add_argument("--run_root", default="runs_gen/diffsize")
+    ap.add_argument("--run_root", default="runs_gen/icd10")
     ap.add_argument("--run_name", default=None)
 
     # eval reporting
@@ -139,37 +139,60 @@ def get_args():
     ap.add_argument("--merge_after", type=int, default=0)
     return ap.parse_args()
 
-# ---------------- ICD-9 Code Handling ----------------
-def format_icd9_properly(code: str) -> str:
-    code = code.strip().upper()
+# ---------------- ICD-10 Code Handling ----------------
+def format_icd10_properly(code: str) -> str:
+    """
+    Format ICD-10 codes to standard format with dot in the right position.
+    Handles category codes, full codes, and alphanumeric extensions.
+    """
+    code = str(code).strip().upper()
     code = re.sub(r"\s+", "", code)
-    if code.endswith("."): code = code[:-1]
-    if code and code[0].isdigit():
-        if '.' not in code and len(code) > 3:
-            return code[:3] + '.' + code[3:]
-    elif code and len(code) > 1:
-        if code[0] in ('V', 'E') and '.' not in code and len(code) > 3:
-            return code[:3] + '.' + code[3:]
+    
+    # Handle empty category codes (like A00.)
+    if code.endswith('.'):
+        # Category code with dot, preserve as is
+        return code
+        
+    # Standard ICD-10 format has a dot after the 3rd character if not already present
+    if code and len(code) >= 3 and '.' not in code:
+        # If it's exactly 3 chars (category code), add the dot
+        if len(code) == 3:
+            return code + '.'
+        # Otherwise, it's a full code with implicit dot
+        return code[:3] + '.' + code[3:]
+        
     return code
 
-def is_valid_icd9(code: str) -> bool:
+def is_valid_icd10(code: str) -> bool:
+    """
+    Check if code follows valid ICD-10-CM format, handling all cases including:
+    - Standard codes (A01.1)
+    - Category codes (A00.)
+    - Alphanumeric extensions (C49.A0)
+    - Empty subcategory markers (A00.)
+    - Seventh character extensions (T82.855A)
+    """
     if not code: return False
-    if code[0].isdigit(): return bool(re.match(r"^\d{3}(\.\d{1,2})?$", code))
-    if code.startswith('V'): return bool(re.match(r"^V\d{2}(\.\d{1,2})?$", code))
-    if code.startswith('E'): return bool(re.match(r"^E\d{3}(\.\d{1})?$", code))
-    return False
+    
+    # Clean up the code first
+    code = code.strip()
+    
+    # Handle category codes (A00.)
+    if re.match(r"^[A-Z]\d{1,2}\.$", code):
+        return True
+        
+    # Handle standard codes and extensions
+    return bool(re.match(r"^[A-Z]\d{1,2}(\.([A-Z0-9]{0,4}))?$", code))
 
 def normalize_code(c: str) -> str:
-    return format_icd9_properly(c)
+    """Normalize ICD-10 code format"""
+    return format_icd10_properly(c)
 
-def get_icd9_parent(code: str) -> str:
+def get_icd10_parent(code: str) -> str:
+    """Extract parent code (category level) from ICD-10 code"""
     if not code or len(code) < 3: return code
-    if code[0].isdigit(): return code.split('.')[0][:3]
-    if code.startswith('V'):
-        base = code.split('.')[0]; return base[:3]
-    if code.startswith('E'):
-        base = code.split('.')[0]; return base[:4] if len(base) >= 4 else base
-    return code
+    # Category level is first 3 characters (letter + 2 digits)
+    return code[:3]
 
 # ---------------- Prompting helpers ----------------
 TEXT_COLS_SAFE = [
@@ -222,9 +245,9 @@ def build_input_text(row: pd.Series, use_structured=True, use_notes=True,
     if use_notes:
         t = serialize_notes(row)
         if t: s.append(t)
-    s.append("[TASK] You are a medical coding expert. Based on the patient information above, generate the appropriate ICD-9-CM diagnosis codes. Follow these guidelines:")
-    s.append("1. List only the ICD-9 codes separated by spaces")
-    s.append("2. Use proper ICD-9 format with decimal points (e.g., 250.00 not 25000)")
+    s.append("[TASK] You are a medical coding expert. Based on the patient information above, generate the appropriate ICD-10-CM diagnosis codes. Follow these guidelines:")
+    s.append("1. List only the ICD-10 codes separated by spaces")
+    s.append("2. Use proper ICD-10 format with decimal points (e.g., A41.9 not A419)")
     s.append("3. Include only codes directly supported by the clinical information")
     s.append("4. Do not include any explanations or text besides the codes themselves")
     s.append("[CODES]")
@@ -243,15 +266,15 @@ def subject_splits(df: pd.DataFrame, subject_col: str,
     return tr, va, te
 
 def lock_label_space(frames: List[pd.DataFrame], label_col: str,
-                     icd9_pkl_path: str = None, use_complete: bool = False) -> MultiLabelBinarizer:
+                     icd10_pkl_path: str = None, use_complete: bool = False) -> MultiLabelBinarizer:
     train_codes = set()
     for fr in frames:
         for codes in fr[label_col]:
-            train_codes.update(format_icd9_properly(str(c)) for c in codes)
-    train_codes = {c for c in train_codes if is_valid_icd9(c)}
-    log.info(f"Found {len(train_codes)} unique valid ICD codes in training data")
+            train_codes.update(format_icd10_properly(str(c)) for c in codes)
+    train_codes = {c for c in train_codes if is_valid_icd10(c)}
+    log.info(f"Found {len(train_codes)} unique valid ICD-10 codes in training data")
 
-    if not use_complete or not icd9_pkl_path:
+    if not use_complete or not icd10_pkl_path:
         all_codes = sorted(train_codes)
         mlb = MultiLabelBinarizer(classes=all_codes)
         mlb.fit([all_codes])
@@ -259,11 +282,11 @@ def lock_label_space(frames: List[pd.DataFrame], label_col: str,
         return mlb
 
     try:
-        icd9_df = pd.read_pickle(icd9_pkl_path)
-        complete_codes = sorted(icd9_df['icd_code'].astype(str).tolist())
-        complete_codes = [format_icd9_properly(code) for code in complete_codes]
-        complete_codes = [code for code in complete_codes if is_valid_icd9(code)]
-        log.info(f"Loaded {len(complete_codes)} complete ICD-9 codes from {icd9_pkl_path}")
+        icd10_df = pd.read_pickle(icd10_pkl_path)
+        complete_codes = sorted(icd10_df['icd_code'].astype(str).tolist())
+        complete_codes = [format_icd10_properly(code) for code in complete_codes]
+        complete_codes = [code for code in complete_codes if is_valid_icd10(code)]
+        log.info(f"Loaded {len(complete_codes)} complete ICD-10 codes from {icd10_pkl_path}")
         mlb = MultiLabelBinarizer(classes=complete_codes)
         mlb.fit([complete_codes])
 
@@ -271,11 +294,11 @@ def lock_label_space(frames: List[pd.DataFrame], label_col: str,
         codes_not_in_complete = len(train_codes) - codes_in_complete
         log.info(f"Training data coverage: in={codes_in_complete}, missing={codes_not_in_complete}")
         if codes_not_in_complete > 0:
-            log.warning("Some training codes not found in complete ICD-9 set.")
+            log.warning("Some training codes not found in complete ICD-10 set.")
         return mlb
 
     except Exception as e:
-        log.error(f"Error loading complete ICD-9 codes: {e}")
+        log.error(f"Error loading complete ICD-10 codes: {e}")
         log.warning("Falling back to training-data-only label space")
         all_codes = sorted(train_codes)
         mlb = MultiLabelBinarizer(classes=all_codes)
@@ -285,8 +308,8 @@ def lock_label_space(frames: List[pd.DataFrame], label_col: str,
 def y_multi_hot(mlb: MultiLabelBinarizer, lists):
     formatted_lists = []
     for row in lists:
-        formatted_row = [format_icd9_properly(str(c)) for c in row]
-        formatted_row = [c for c in formatted_row if is_valid_icd9(c)]
+        formatted_row = [format_icd10_properly(str(c)) for c in row]
+        formatted_row = [c for c in formatted_row if is_valid_icd10(c)]
         formatted_lists.append(formatted_row)
     return mlb.transform(formatted_lists)
 
@@ -320,8 +343,8 @@ class GenCodesDataset(Dataset):
 
         targets = []
         for codes in rows[label_col].tolist():
-            formatted_codes = [format_icd9_properly(str(c)) for c in codes]
-            formatted_codes = [c for c in formatted_codes if is_valid_icd9(c)]
+            formatted_codes = [format_icd10_properly(str(c)) for c in codes]
+            formatted_codes = [c for c in formatted_codes if is_valid_icd10(c)]
             targets.append(" ".join(sorted(set(formatted_codes))))
 
         self.prompt_ids = [tok.encode(p + "\n", add_special_tokens=True) for p in prompts]
@@ -458,7 +481,7 @@ def generate_codes(model, tok, prompts: List[str], labels_vocab: List[str],
             cand = [normalize_code(z) for z in tokens if z]
             seen, keep = set(), []
             for c in cand:
-                if c in allowed and is_valid_icd9(c) and c not in seen:
+                if c in allowed and is_valid_icd10(c) and c not in seen:
                     seen.add(c); keep.append(c)
             preds.append(keep)
         
@@ -510,7 +533,7 @@ def eval_sets(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     }
 
 def hierarchical_eval(y_true: np.ndarray, y_pred: np.ndarray, label_vocab: List[str]) -> Dict[str, float]:
-    code_to_parent = {code: get_icd9_parent(code) for code in label_vocab}
+    code_to_parent = {code: get_icd10_parent(code) for code in label_vocab}
     parent_to_idx = {}
     for idx, code in enumerate(label_vocab):
         parent = code_to_parent[code]
@@ -596,8 +619,8 @@ class DetailedEvalCallback(TrainerCallback):
             if len(parts) > 1:
                 subset_prompts.append(parts[0] + "[CODES]")
                 target_text = parts[1].strip()
-                gold_codes = [format_icd9_properly(c) for c in re.split(r"[^A-Za-z0-9\.]+", target_text) if c]
-                gold_codes = [c for c in gold_codes if is_valid_icd9(c)]
+                gold_codes = [format_icd10_properly(c) for c in re.split(r"[^A-Za-z0-9\.]+", target_text) if c]
+                gold_codes = [c for c in gold_codes if is_valid_icd10(c)]
                 gold_codes_lists.append(gold_codes)
             else:
                 subset_prompts.append(prompt_text)
@@ -706,16 +729,16 @@ def show_test_predictions(df: pd.DataFrame, preds: List[List[str]],
     rank0_print(f"Showing {n_show} random test examples:")
     for i in idxs:
         row = df.iloc[i]
-        gold = sorted({format_icd9_properly(str(c)) for c in row[label_col]
-                       if is_valid_icd9(format_icd9_properly(str(c)))})
+        gold = sorted({format_icd10_properly(str(c)) for c in row[label_col]
+                       if is_valid_icd10(format_icd10_properly(str(c)))})
         pred = preds[i]
         missing = sorted([c for c in gold if c not in pred])
         extra   = sorted([c for c in pred if c not in gold])
 
-        gold_parents = {get_icd9_parent(c) for c in gold}
-        pred_parents = {get_icd9_parent(c) for c in pred}
+        gold_parents = {get_icd10_parent(c) for c in gold}
+        pred_parents = {get_icd10_parent(c) for c in pred}
         parent_matches = sorted([f"{c} (parent)" for c in pred
-                                 if get_icd9_parent(c) in gold_parents and c not in gold])
+                                 if get_icd10_parent(c) in gold_parents and c not in gold])
 
         y_true = np.zeros(len(label_vocab))
         y_pred = np.zeros(len(label_vocab))
@@ -817,7 +840,7 @@ def main():
 
     # Label space
     mlb = lock_label_space([train_df, val_df, test_df], args.label_col,
-                           icd9_pkl_path=args.icd9_pickle, use_complete=bool(args.use_complete_icd9))
+                           icd10_pkl_path=args.icd10_pickle, use_complete=bool(args.use_complete_icd10))
     labels_vocab = mlb.classes_.tolist()
     y_val  = y_multi_hot(mlb, val_df[args.label_col].tolist())
     y_test = y_multi_hot(mlb, test_df[args.label_col].tolist())
@@ -834,7 +857,7 @@ def main():
 
     # Run dir
     size_str = f"N{args.train_size}" if args.train_size > 0 else "full"
-    tag = args.run_name or f"{now_tag()}_{size_str}_icd9{'_complete' if args.use_complete_icd9 else ''}"
+    tag = args.run_name or f"{now_tag()}_{size_str}_icd10{'_complete' if args.use_complete_icd10 else ''}"
     RUN_DIR = make_run_dir(args.run_root, tag)
     rank0_print(f"Run dir: {RUN_DIR}")
 
@@ -843,7 +866,7 @@ def main():
             "model": args.llama_model, "max_len": args.max_len, "lr": args.learning_rate,
             "epochs": args.epochs, "gen_max_new": args.gen_max_new, "tgt_reserve_tok": args.tgt_reserve_tok,
             "seed": args.seed, "train_rows": len(train_df),
-            "icd9_pickle": args.icd9_pickle, "use_complete_icd9": bool(args.use_complete_icd9),
+            "icd10_pickle": args.icd10_pickle, "use_complete_icd10": bool(args.use_complete_icd10),
             "total_label_space": len(labels_vocab),
             "test_batch_size": args.test_batch_size
         })

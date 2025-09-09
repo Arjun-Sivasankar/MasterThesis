@@ -37,7 +37,7 @@ start=$(date +%s)
 export CUDA_VISIBLE_DEVICES=0
 GPUS=1
 
-srun torchrun --standalone --nproc_per_node=${GPUS} gen/finetune_hpo.py \
+srun torchrun --standalone --nproc_per_node=${GPUS} gen/hpo/finetune_hpo.py \
   --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/train_df.pkl \
   --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/val_df.pkl \
   --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/test_df.pkl \

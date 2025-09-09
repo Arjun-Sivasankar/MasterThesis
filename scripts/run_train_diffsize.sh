@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=diffsize_train
 #SBATCH --partition=capella            # GPU partition
-#SBATCH --gres=gpu:1                   # 1 GPU
+#SBATCH --gres=gpu:3                   # 3 GPUs
 #SBATCH --cpus-per-task=8              # CPU cores for data loading
 #SBATCH --nodes=1
 #SBATCH --mem=64G                      # RAM
@@ -38,30 +38,49 @@ export CUDA_VISIBLE_DEVICES=0,1
 GPUS=${SLURM_GPUS_ON_NODE:-2}
 
 # --- 6) Run training ---
-echo "[INFO] Starting finetuning..."
-start=$(date +%s)
-# srun torchrun --standalone --nproc_per_node=${GPUS} gen/finetune_llama_gen_difftrainsize_improved.py \
-#     --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/train_df.pkl \
-#     --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/val_df.pkl \
-#     --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/test_df.pkl \
-#     --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
-#     --train_size 60000 \
-#     --eval_sample_size 100 \
-#     --epochs 10 --learning_rate 2e-4 
+# echo "[INFO] Starting ICD-9 finetuning..."
+# start=$(date +%s)
+# # srun torchrun --standalone --nproc_per_node=${GPUS} gen/finetune_llama_gen_difftrainsize_improved.py \
+# #     --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/train_df.pkl \
+# #     --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/val_df.pkl \
+# #     --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/test_df.pkl \
+# #     --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
+# #     --train_size 60000 \
+# #     --eval_sample_size 100 \
+# #     --epochs 10 --learning_rate 2e-4 
 
-srun torchrun --standalone --nproc_per_node=${GPUS} gen/finetune_llama_gen_ddp.py \
-    --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/train_df.pkl \
-    --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/val_df.pkl \
-    --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/test_df.pkl \
-    --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
-    --train_size 10000 \
+# srun torchrun --standalone --nproc_per_node=${GPUS} gen/finetune_llama_gen_ddp.py \
+#     --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/train_df.pkl \
+#     --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/val_df.pkl \
+#     --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/test_df.pkl \
+#     --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
+#     --train_size 10000 \
+#     --eval_sample_size 100 \
+#     --per_device_train_batch_size 1 \
+#     --per_device_eval_batch_size 1 \
+#     --test_batch_size 16 \
+#     --grad_accum 16 \
+#     --epochs 6 \
+#     --use_complete_icd9 1
+
+echo "[INFO] Starting ICD-10 finetuning..."
+start=$(date +%s)
+
+srun torchrun --standalone --nproc_per_node=${GPUS} gen/finetune_llama_gen_ddp_icd10.py \
+    --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/train_df.pkl \
+    --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/val_df.pkl \
+    --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/test_df.pkl \
+    --icd10_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd10.pkl \
+    --label_col icd_code \
+    --train_size 40000 \
     --eval_sample_size 100 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --test_batch_size 16 \
     --grad_accum 16 \
     --epochs 6 \
-    --use_complete_icd9 1
+    --use_complete_icd10 1 \
+    --run_root runs_gen/icd10
 
 end=$(date +%s)
 echo "[TIME] Elapsed: $((end-start)) seconds"
