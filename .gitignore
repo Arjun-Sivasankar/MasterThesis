@@ -20,6 +20,3 @@ models/
 
 # icd code embeddings
 icd_index_v9/
-
-# Text gen
-gen/TextGen/
