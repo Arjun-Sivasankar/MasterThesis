@@ -7,6 +7,19 @@ icd10_analysis/
 icd9_analysis/
 
 ## Runs and checkpoints
+runs/
 runs_gen/
 runs_hpo/
 runs_base_eval_fast/
+
+# wandb logs
+wandb/
+
+# models
+models/
+
+# icd code embeddings
+icd_index_v9/
+
+# Text gen
+gen/TextGen/

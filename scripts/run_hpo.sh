@@ -35,7 +35,8 @@ start=$(date +%s)
 
 # Use a single GPU for HPO
 export CUDA_VISIBLE_DEVICES=0
-GPUS=1
+GPUS=${SLURM_GPUS_ON_NODE:-2}
+echo "[INFO] Using $GPUS GPUs"
 
 srun torchrun --standalone --nproc_per_node=${GPUS} gen/hpo/finetune_hpo.py \
   --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/gen_data/train_df.pkl \
