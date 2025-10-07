@@ -11,6 +11,8 @@ runs/
 runs_gen/
 runs_hpo/
 runs_base_eval_fast/
+runs_textgen
+runs_codegen
 
 # wandb logs
 wandb/
@@ -20,3 +22,5 @@ models/
 
 # icd code embeddings
 icd_index_v9/
+
+icd9_analysis_improved/

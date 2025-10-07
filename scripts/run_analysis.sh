@@ -38,13 +38,21 @@ echo "[INFO] Virtual env loaded: $VIRTUAL_ENV"
 #     --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
 #     --output_dir icd9_analysis
 
-echo "[INFO] Starting ICD-10 analysis..."
-python analysis/analyse_icd10_distribution.py \
-    --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/train_df.pkl \
-    --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/val_df.pkl \
-    --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/test_df.pkl \
-    --icd10_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd10.pkl \
-    --output_dir icd10_analysis
+# echo "[INFO] Starting ICD-10 analysis..."
+# python analysis/analyse_icd10_distribution.py \
+#     --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/train_df.pkl \
+#     --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/val_df.pkl \
+#     --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd10/test_df.pkl \
+#     --icd10_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd10.pkl \
+#     --output_dir icd10_analysis
+
+echo "[INFO] Starting ICD-9 analysis..."
+python analysis/new.py \
+    --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/train_df.pkl \
+    --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/val_df.pkl \
+    --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/test_df.pkl \
+    # --icd10_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd10.pkl \
+    # --output_dir icd10_analysis
 
 # --- 7) Exit status ---
 status=$?

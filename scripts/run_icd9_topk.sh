@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=diffsize_train
+#SBATCH --job-name=ICD9_topk
 #SBATCH --partition=capella            # GPU partition
 #SBATCH --gres=gpu:3                   # 3 GPUs
 #SBATCH --cpus-per-task=8              # CPU cores for data loading
 #SBATCH --nodes=1
 #SBATCH --mem=64G                      # RAM
 #SBATCH --time=24:00:00                # Max walltime
-#SBATCH --output=logs/train_textgen_%j.out    # stdout+stderr log
+#SBATCH --output=logs/ICD9_topk50_%j.out    # stdout+stderr log
 ## SBATCH --output=logs/%j.out    # stdout+stderr log
 
 # --- 1) Load modules ---
@@ -38,26 +38,33 @@ export CUDA_VISIBLE_DEVICES=0,1
 GPUS=${SLURM_GPUS_ON_NODE:-2}
 echo "[INFO] Using $GPUS GPUs"
 
-SCRIPT="gen/TextGen/finetune_textgen.py"
+SCRIPT="gen/finetune_llama_gen_ddp_icd9_topk.py"
 
 # --- 6) Run training ---
 start=$(date +%s)
 echo "[INFO] Job started at $(date)"
 
 echo "[INFO] Running script: $SCRIPT"
-echo "[INFO] Starting ICD-9 finetuning (Text-Gen Diagnosis) ...."
+
+echo "[INFO] Starting ICD-9 finetuning with top-k codes ...."
 srun torchrun --standalone --nproc_per_node=${GPUS} ${SCRIPT} \
-    --data_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/merged_icd9.pkl \
-    --llm meta-llama/Llama-3.2-1B-Instruct \
-    --target_mode icd_titles \
-    --icd_index_dir ./gen/TextGen/icd_index_v9 \
-    --encoder_model cambridgeltl/SapBERT-from-PubMedBERT-fulltext \
-    --epochs 4 --per_device_train_batch_size 1 --grad_accum 16 \
-    --gen_max_new 128 --N_max_terms 12 \
-    --faiss_rows 50 --tau_cos 0.40 --tau_final 0.60 --w_cos 0.6 --w_fuz 0.4 \
-    --eval_head_k 0
+    --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/train_df.pkl \
+    --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/val_df.pkl \
+    --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/test_df.pkl \
+    --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
+    --train_size 54981 \
+    --eval_sample_size 100 \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --test_batch_size 16 \
+    --grad_accum 16 \
+    --epochs 6 \
+    --use_complete_icd9 1 \
+    --top_k 50 \
+
 
 end=$(date +%s)
+echo "[INFO] Job finished at $(date)"
 echo "[TIME] Elapsed: $((end-start)) seconds"
 
 # --- 7) Exit status ---

@@ -1,0 +1,638 @@
+import os, re, json, time, argparse, logging, pickle, atexit, sys
+from typing import List, Dict
+from collections import Counter
+import numpy as np
+import pandas as pd
+import torch
+import torch.distributed as dist
+from torch.utils.data import Dataset
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, EarlyStoppingCallback
+)
+from peft import LoraConfig, get_peft_model
+from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+import faiss
+from rapidfuzz.fuzz import token_set_ratio
+from transformers import AutoTokenizer as HFTok, AutoModel as HFModel
+import datetime
+from tqdm.auto import tqdm
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("train_textgen_icd")
+
+# ------------------ DDP helpers ------------------
+def _env_rank():
+    for k in ("LOCAL_RANK", "RANK"):
+        v = os.environ.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except:
+                pass
+    return 0
+
+def is_main_process():
+    return _env_rank() == 0
+
+def dist_is_initialized():
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+def barrier():
+    if dist_is_initialized():
+        try:
+            torch.distributed.barrier()
+        except Exception:
+            pass
+
+def _cleanup_dist():
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                torch.distributed.barrier()
+            except Exception:
+                pass
+            torch.distributed.destroy_process_group()
+    except Exception:
+        pass
+
+atexit.register(_cleanup_dist)
+
+if not is_main_process():
+    logging.getLogger().setLevel(logging.WARNING)
+
+# ------------------ utilities ------------------
+TEXT_COLS_SAFE = [
+    "Chief Complaint","History of Present Illness","Past Medical History",
+    "Family History","Physical Exam","Pertinent Results",
+    "Brief Hospital Course","Medications on Admission"
+]
+
+def clean_text(x):
+    if isinstance(x, (np.ndarray, pd.Series)):
+        try:
+            x = " ".join(map(str, x.tolist()))
+        except Exception:
+            x = str(x)
+    if x is None:
+        return ""
+    s = str(x).replace("\x00"," ").replace("\r"," ")
+    s = re.sub(r"_+"," ", s)
+    return re.sub(r"\s+"," ", s).strip()
+
+def to_list(x) -> List[str]:
+    """Robustly convert many possible types to a flat list[str]."""
+    if x is None:
+        return []
+    # Already a python container
+    if isinstance(x, (list, tuple, set)):
+        out=[]
+        for v in x:
+            if v is None:
+                continue
+            if isinstance(v, float) and np.isnan(v):
+                continue
+            sv = str(v).strip()
+            if sv:
+                out.append(sv)
+        return out
+    # Numpy / pandas
+    if isinstance(x, (np.ndarray, pd.Series)):
+        arr = x.tolist()
+        if isinstance(arr, list):
+            out=[]
+            for v in arr:
+                if v is None:
+                    continue
+                if isinstance(v, float) and np.isnan(v):
+                    continue
+                sv = str(v).strip()
+                if sv:
+                    out.append(sv)
+            return out
+        return [str(arr)] if arr is not None and str(arr).strip() else []
+    # Strings (including stringified lists)
+    s = str(x).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return []
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            import ast
+            v = ast.literal_eval(s)
+            if isinstance(v, (list, tuple, set)):
+                out=[]
+                for z in v:
+                    if z is None:
+                        continue
+                    if isinstance(z, float) and np.isnan(z):
+                        continue
+                    sz = str(z).strip()
+                    if sz:
+                        out.append(sz)
+                return out
+        except Exception:
+            pass
+    return [t for t in re.split(r"[,\s]+", s) if t]
+
+def norm_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s\-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def format_icd9(code: str) -> str:
+    code = re.sub(r"\s+","", str(code)).upper()
+    if code.endswith("."):
+        code = code[:-1]
+    if not code:
+        return ""
+    if code[0].isdigit():
+        if len(code)>3 and "." not in code:
+            return code[:3]+"."+code[3:]
+        return code
+    if code[0] in ("V","E"):
+        if code[0]=="V" and len(code)>3 and "." not in code:
+            return code[:3]+"."+code[3:]
+        if code[0]=="E" and len(code)>4 and "." not in code:
+            return code[:4]+"."+code[4:]
+        return code
+    return code
+
+def is_valid_icd9(code: str) -> bool:
+    if not code:
+        return False
+    c = code.upper()
+    if c[0].isdigit():
+        return bool(re.match(r"^\d{3}(\.\d{1,2})?$", c))
+    if c[0]=="V":
+        return bool(re.match(r"^V\d{2}(\.\d{1,2})?$", c))
+    if c[0]=="E":
+        return bool(re.match(r"^E\d{3}(\.\d{1})?$", c))
+    return False
+
+def to_icd9_parent(c: str) -> str:
+    if not c:
+        return c
+    return c.split(".")[0][:3].upper()
+
+def serialize_structured_readable(row: pd.Series) -> str:
+    ndc = " ".join(to_list(row.get("ndc", []))[:24])
+    proc = " ".join(to_list(row.get("pro_code", []))[:24])
+    labs = " ".join(to_list(row.get("lab_test", []))[:48])
+    parts=[]
+    parts.append(f"DEMOGRAPHICS: gender={row.get('gender','')} age_group={row.get('age','')}")
+    if ndc:
+        parts.append(f"MEDICATIONS: {ndc}")
+    if proc:
+        parts.append(f"PROCEDURES: {proc}")
+    if labs:
+        parts.append(f"LAB TESTS: {labs}")
+    return "\n".join(parts)
+
+def serialize_notes(row: pd.Series) -> str:
+    parts=[]
+    for col in TEXT_COLS_SAFE:
+        if col in row:
+            t = clean_text(row[col])
+            if isinstance(t, str) and t:
+                parts.append(f"{col}: {t}")
+    return "\n".join(parts)
+
+def build_textgen_prompt(row: pd.Series, N_max_terms: int) -> str:
+    s=[]
+    s.append(f"[VISIT] subject_id={row.get('subject_id_x','?')} hadm_id={row.get('hadm_id','?')}")
+    s.append(serialize_structured_readable(row))
+    notes = serialize_notes(row)
+    if notes:
+        s.append(notes)
+    s.append("[TASK] List the final clinical diagnoses for this admission.")
+    s.append("[FORMAT]")
+    s.append("- One diagnosis per line")
+    s.append("- Avoid abbreviations if possible")
+    s.append("- No ICD codes or explanations")
+    s.append(f"- Maximum: {N_max_terms} lines")
+    s.append("[OUTPUT]")
+    return "\n".join([x for x in s if x])
+
+# ------------------ datasets ------------------
+class SFTTextGenDataset(Dataset):
+    def __init__(self, df: pd.DataFrame, tokenizer, label_col: str, target_mode: str,  # "icd_titles" or "discharge_dx"
+                 icd_index_dir: str, max_len: int, N_max_terms: int):
+        self.tok = tokenizer
+        self.label_col = label_col
+        self.target_mode = target_mode
+        self.max_len = max_len
+        self.N_max_terms = N_max_terms
+        self.code2title = {}
+        if target_mode == "icd_titles":
+            try:
+                with open(os.path.join(icd_index_dir, "code2title.json"), "r") as f:
+                    self.code2title = json.load(f)
+                if is_main_process():
+                    log.info(f"Loaded {len(self.code2title)} ICD-9 titles")
+            except Exception as e:
+                if is_main_process():
+                    log.warning(f"Could not load code2title.json: {e}")
+        inputs, targets, kept_idx = [], [], []
+        for idx, row in df.reset_index(drop=True).iterrows():
+            prompt = build_textgen_prompt(row, self.N_max_terms)
+            if target_mode == "icd_titles":
+                codes = [format_icd9(c) for c in to_list(row.get(label_col, [])) if c]
+                codes = [c for c in codes if is_valid_icd9(c)]
+                titles = []
+                for c in codes:
+                    t = self.code2title.get(c, "").strip()
+                    if len(t) > 3:
+                        titles.append(f"- {t}")
+                target = "\n".join(titles)
+                has_supervision = len(titles) > 0
+            else:  # discharge_dx
+                target_raw = clean_text(row.get("Discharge Diagnosis",""))
+                # require some supervision tokens
+                target = target_raw if len(target_raw) >= 5 else ""
+                has_supervision = len(target) > 0
+            if has_supervision:
+                inputs.append(prompt)
+                targets.append(target)
+                kept_idx.append(idx)
+        self.inputs = inputs
+        self.targets = targets
+        self.kept_idx = kept_idx  # keep a backpointer if you need it later
+        dropped = len(df) - len(self.inputs)
+        if is_main_process():
+            log.info(f"SFT dataset: kept={len(self.inputs)} dropped_empty_targets={dropped} "
+                     f"(mode={target_mode})")
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        user_msg = {"role": "user", "content": self.inputs[idx]}
+        asst_msg = {"role": "assistant", "content": self.targets[idx]}
+        # prompt-only to compute prompt length
+        prompt_text = self.tok.apply_chat_template([user_msg], tokenize=False, add_generation_prompt=True)
+        prompt_ids = self.tok(prompt_text, return_tensors="pt", truncation=True, max_length=self.max_len).input_ids[0]
+        # full example (prompt + assistant target)
+        full_text = self.tok.apply_chat_template([user_msg, asst_msg], tokenize=False, add_generation_prompt=False)
+        full = self.tok(full_text, return_tensors="pt", truncation=True, max_length=self.max_len)
+        input_ids = full.input_ids[0]
+        attn = full.attention_mask[0]
+        # label mask: ignore prompt tokens
+        labels = input_ids.clone()
+        prompt_len = min(len(prompt_ids), len(input_ids))
+        labels[:prompt_len] = -100
+        return {"input_ids": input_ids, "attention_mask": attn, "labels": labels}
+
+def pad_collate(features, tok):
+    pad_id = tok.pad_token_id
+    max_len = max(len(f["input_ids"]) for f in features)
+    B = len(features)
+    input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
+    attention_mask = torch.zeros((B, max_len), dtype=torch.long)
+    labels = torch.full((B, max_len), -100, dtype=torch.long)
+    for i, f in enumerate(features):
+        L = len(f["input_ids"])
+        input_ids[i,:L] = f["input_ids"]
+        attention_mask[i,:L] = f["attention_mask"]
+        labels[i,:L] = f["labels"]
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+# ------------------ LLM & LoRA ------------------
+def load_llm_with_lora(model_name):
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
+        dtype = torch.bfloat16
+    elif torch.cuda.is_available():
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+    tok.padding_side = "right"
+    base = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=dtype, low_cpu_mem_usage=True
+    )
+    base.config.pad_token_id = tok.pad_token_id
+    base.config.use_cache = False  # needed with gradient checkpointing
+    lora_cfg = LoraConfig(
+        r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+        task_type="CAUSAL_LM"
+    )
+    model = get_peft_model(base, lora_cfg)
+    # IMPORTANT: allow grad on inputs when gradient checkpointing is used
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        try:
+            model.get_input_embeddings().weight.requires_grad_(True)
+        except Exception:
+            pass
+    if is_main_process():
+        model.print_trainable_parameters()
+    return model, tok
+
+# ------------------ generation ------------------
+@torch.no_grad()
+def generate_terms(model, tokenizer, prompts: List[str], max_len: int, max_new: int, batch_size: int):
+    model.eval()
+    device = next(model.parameters()).device
+    out_all = []
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i+batch_size]
+        # Build chat template strings with generation prompt
+        prompt_texts = [
+            tokenizer.apply_chat_template(
+                [{"role":"user","content":p}], tokenize=False, add_generation_prompt=True
+            ) for p in batch_prompts
+        ]
+        enc = tokenizer(
+            prompt_texts, return_tensors="pt", padding=True, truncation=True, max_length=max_len
+        ).to(device)
+        with torch.cuda.amp.autocast(enabled=(device.type=="cuda")):
+            gen = model.generate(
+                **enc, max_new_tokens=max_new, do_sample=False, num_beams=2,
+                no_repeat_ngram_size=2, pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id, return_dict_in_generate=True
+            )
+        seq = gen.sequences  # [B, L_in + L_new]
+        in_lens = enc["attention_mask"].sum(dim=1).tolist()
+        for b in range(seq.size(0)):
+            new_tokens = seq[b, in_lens[b]:]
+            text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            # parse lines -> terms
+            terms=[]
+            for line in text.split("\n"):
+                t = re.sub(r"^[\-\*\u2022]+\s*", "", line).strip()
+                if t:
+                    terms.append(t)
+            out_all.append(terms)
+    return out_all
+
+# ------------------ HF SapBERT mean encoder ------------------
+class HFMeanEncoder:
+    def __init__(self, model_name: str):
+        self.tokenizer = HFTok.from_pretrained(model_name)
+        self.model = HFModel.from_pretrained(model_name)
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device).eval()
+
+    def _mean_pool(self, last_hidden, attention_mask):
+        mask = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+        s = torch.sum(last_hidden * mask, dim=1)
+        d = torch.clamp(mask.sum(dim=1), min=1e-9)
+        return s / d
+
+    @torch.no_grad()
+    def encode(self, texts: List[str], batch_size=32) -> np.ndarray:
+        if not texts:
+            return np.zeros((0,768), dtype=np.float32)
+        chunks=[]
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            enc = self.tokenizer(batch, padding=True, truncation=True, max_length=128, return_tensors="pt").to(self.device)
+            out = self.model(**enc)
+            emb = self._mean_pool(out.last_hidden_state, enc.attention_mask)
+            emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+            chunks.append(emb.cpu().numpy())
+        return np.vstack(chunks)
+
+# ------------------ Mapper ------------------
+class ICDMapper:
+    def __init__(self, index_dir, encoder_model_cli=None, tau_cos=0.40, tau_final=0.60, w_cos=0.6, w_fuz=0.4, faiss_rows=20):
+        self.dir = index_dir
+        self.faiss_rows = faiss_rows
+        self.tau_cos = tau_cos
+        self.tau_final = tau_final
+        self.w_cos = w_cos
+        self.w_fuz = w_fuz
+        self.last_stats=[]
+        # index
+        idx_path = os.path.join(self.dir, "icd.faiss")
+        if not os.path.exists(idx_path):
+            raise FileNotFoundError(f"FAISS index not found: {idx_path}")
+        self.index = faiss.read_index(idx_path)
+        # rows
+        rows_path = os.path.join(self.dir, "rows.json")
+        if not os.path.exists(rows_path):
+            raise FileNotFoundError(f"rows.json not found: {rows_path}")
+        with open(rows_path, "r") as f:
+            self.rows = json.load(f)
+        if not isinstance(self.rows, list):
+            raise ValueError("rows.json must be a list of {text, code}")
+        if len(self.rows) != self.index.ntotal:
+            raise ValueError(f"rows.json length ({len(self.rows)}) must match FAISS ntotal ({self.index.ntotal})")
+        # meta
+        meta = {}
+        meta_path = os.path.join(self.dir, "meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path,"r") as f:
+                meta = json.load(f)
+        self.metric = meta.get("metric","ip").lower()  # "ip" or "l2"
+        enc_name = meta.get("encoder_model", encoder_model_cli)
+        if not enc_name:
+            enc_name = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+        self.encoder = HFMeanEncoder(enc_name)
+        if is_main_process():
+            log.info(f"FAISS index loaded: {self.index.ntotal} rows (metric={self.metric})")
+            log.info(f"Encoder model: {enc_name}")
+
+    def map_terms(self, term_lists: List[List[str]]):
+        self.last_stats=[]
+        all_codes=[]
+        for terms in term_lists:
+            mapped=set()
+            if not terms:
+                all_codes.append([])
+                self.last_stats.append((0,0))
+                continue
+            embs = self.encoder.encode(terms)
+            n_mapped=0
+            for t_idx, term in enumerate(terms):
+                if not term or len(term) < 3:
+                    continue
+                norm_t = norm_text(term)
+                if len(norm_t) < 3:
+                    continue
+                D, I = self.index.search(embs[t_idx:t_idx+1], self.faiss_rows)  # (1,k)
+                D, I = D[0], I[0]
+                cand=[]
+                for j, row_idx in enumerate(I):
+                    if row_idx < 0:
+                        continue
+                    entry = self.rows[row_idx]
+                    cand_text = entry.get("text","")
+                    cand_code = entry.get("code","")
+                    if not cand_text or not cand_code:
+                        continue
+                    if self.metric == "ip":
+                        cos = float(D[j])  # IP on normalized vectors ≈ cosine
+                    else:
+                        cos = 1.0 - float(D[j]) / 2.0  # L2 on normalized vectors -> cosine-like
+                    if cos < self.tau_cos:
+                        continue
+                    fuzzy = token_set_ratio(norm_t, norm_text(cand_text)) / 100.0
+                    score = self.w_cos * cos + self.w_fuz * fuzzy
+                    if score >= self.tau_final:
+                        cand.append((cand_code, score))
+                if cand:
+                    cand.sort(key=lambda x: x[1], reverse=True)
+                    mapped.add(cand[0][0]); n_mapped += 1
+            self.last_stats.append((len(terms), n_mapped))
+            all_codes.append(sorted(mapped))
+        return all_codes
+
+# ------------------ eval helpers ------------------
+def build_eval_labels(train_gold_lists, head_k=0):
+    counter = Counter([c for codes in train_gold_lists for c in codes])
+    if head_k and head_k > 0:
+        return [c for c,_ in counter.most_common(head_k)]
+    return sorted(counter.keys())
+
+def restrict_to(codes_lists, allowed):
+    S=set(allowed)
+    return [[c for c in codes if c in S] for codes in codes_lists]
+
+def multihot(codes_lists, labels):
+    idx = {c:i for i,c in enumerate(labels)}
+    Y = np.zeros((len(codes_lists), len(labels)), dtype=np.int32)
+    for i, lst in enumerate(codes_lists):
+        for c in lst:
+            j = idx.get(c)
+            if j is not None:
+                Y[i,j]=1
+    return Y
+
+def eval_pack(y_true, y_pred):
+    return {
+        "precision_micro": float(precision_score(y_true, y_pred, average='micro', zero_division=0)),
+        "recall_micro": float(recall_score(y_true, y_pred, average='micro', zero_division=0)),
+        "f1_micro": float(f1_score(y_true, y_pred, average='micro', zero_division=0)),
+        "precision_macro": float(precision_score(y_true, y_pred, average='macro', zero_division=0)),
+        "recall_macro": float(recall_score(y_true, y_pred, average='macro', zero_division=0)),
+        "f1_macro": float(f1_score(y_true, y_pred, average='macro', zero_division=0)),
+        "precision_samples": float(precision_score(y_true, y_pred, average='samples', zero_division=0)),
+        "recall_samples": float(recall_score(y_true, y_pred, average='samples', zero_division=0)),
+        "f1_samples": float(f1_score(y_true, y_pred, average='samples', zero_division=0)),
+    }
+
+def add_parent_macro_f1(metrics, gold_lists, pred_lists):
+    g = [[to_icd9_parent(c) for c in lst] for lst in gold_lists]
+    p = [[to_icd9_parent(c) for c in lst] for lst in pred_lists]
+    labels = sorted({x for lst in g for x in lst})
+    Yg = multihot(g, labels); Yp = multihot(p, labels)
+    metrics["f1_macro_parent"] = float(f1_score(Yg, Yp, average="macro", zero_division=0))
+
+# ------------------ main ------------------
+def main():
+    ap = argparse.ArgumentParser()
+    # data
+    ap.add_argument("--data_pickle", required=True)
+    ap.add_argument("--subject_col", default="subject_id_x")
+    ap.add_argument("--label_col", default="icd_code")
+    # targets for SFT
+    ap.add_argument("--target_mode", choices=["icd_titles","discharge_dx"], default="icd_titles")
+    ap.add_argument("--icd_index_dir", default="./gen/TextGen/icd_index_v9")
+    # llm & train
+    ap.add_argument("--llm", default="meta-llama/Llama-3.2-1B-Instruct")
+    ap.add_argument("--max_len", type=int, default=3072)
+    ap.add_argument("--gen_max_new", type=int, default=128)
+    ap.add_argument("--N_max_terms", type=int, default=12)
+    ap.add_argument("--epochs", type=int, default=4)
+    ap.add_argument("--per_device_train_batch_size", type=int, default=1)
+    ap.add_argument("--per_device_eval_batch_size", type=int, default=1)
+    ap.add_argument("--grad_accum", type=int, default=16)
+    ap.add_argument("--learning_rate", type=float, default=2e-4)
+    ap.add_argument("--weight_decay", type=float, default=0.0)
+    ap.add_argument("--warmup_ratio", type=float, default=0.03)
+    ap.add_argument("--early_stop", type=int, default=1)
+    ap.add_argument("--patience", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=42)
+    # DDP (torchrun sets LOCAL_RANK)
+    ap.add_argument("--local_rank", type=int, default=-1)
+    # mapping (SapBERT+FAISS+fuzzy)
+    ap.add_argument("--encoder_model", default="cambridgeltl/SapBERT-from-PubMedBERT-fulltext")
+    ap.add_argument("--faiss_rows", type=int, default=50)
+    ap.add_argument("--tau_cos", type=float, default=0.40)
+    ap.add_argument("--tau_final", type=float, default=0.60)
+    ap.add_argument("--w_cos", type=float, default=0.6)
+    ap.add_argument("--w_fuz", type=float, default=0.4)
+    # evaluation label space
+    ap.add_argument("--eval_head_k", type=int, default=0)  # 0=full space
+    args = ap.parse_args()
+
+    # init DDP (Trainer also uses local_rank)
+    if args.local_rank != -1:
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend="nccl")
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+
+    # -------- load data --------
+    if is_main_process():
+        log.info(f"Loading data: {args.data_pickle}")
+    try:
+        df = pd.read_pickle(args.data_pickle)
+    except Exception:
+        with open(args.data_pickle, "rb") as f:
+            df = pickle.load(f)
+    subs = df[args.subject_col].dropna().unique()
+    tr_subs, te_subs = train_test_split(subs, test_size=0.10, random_state=args.seed)
+    tr_subs, va_subs = train_test_split(tr_subs, test_size=0.10/0.90, random_state=args.seed)
+    train_df = df[df[args.subject_col].isin(tr_subs)].copy()
+    val_df = df[df[args.subject_col].isin(va_subs)].copy()
+    test_df = df[df[args.subject_col].isin(te_subs)].copy()
+    if is_main_process():
+        log.info(f"Split sizes: train={len(train_df)} val={len(val_df)} test={len(test_df)}")
+
+    # gold code lists
+    def extract_codes(df_):
+        out=[]
+        for _, r in df_.iterrows():
+            raw = r.get(args.label_col, [])
+            lst = to_list(raw)
+            lst = [format_icd9(c) for c in lst if c]
+            lst = [c for c in lst if is_valid_icd9(c)]
+            out.append(lst)
+        return out
+    train_gold = extract_codes(train_df)
+    val_gold = extract_codes(val_df)
+    test_gold = extract_codes(test_df)
+    train_df["gold_codes"] = train_gold
+    val_df["gold_codes"] = val_gold
+    test_df["gold_codes"] = test_gold
+    labels_full = build_eval_labels(train_gold)
+    labels_head = build_eval_labels(train_gold, head_k=args.eval_head_k) if args.eval_head_k>0 else []
+    if is_main_process():
+        log.info(f"Label space (FULL): {len(labels_full)} codes")
+        if labels_head:
+            log.info(f"Head@{args.eval_head_k}: {len(labels_head)}")
+
+    # -------- Token Audit (Inserted Here) --------
+    if is_main_process():
+        log.info("Performing token audit on validation set...")
+        tok = AutoTokenizer.from_pretrained(args.llm)
+        prompt_lens = []
+        full_lens = []
+        for _, row in val_df.iterrows():
+            prompt = build_textgen_prompt(row, args.N_max_terms)
+            # Extract target based on target_mode (similar to SFTTextGenDataset)
+            if args.target_mode == "icd_titles":
+                codes = [format_icd9(c) for c in to_list(row.get(args.label_col, [])) if c]
+                codes = [c for c in codes if is_valid_icd9(c)]
+                with open(os.path.join(args.icd_index_dir, "code2title.json"), "r") as f:
+                    code2title = json.load(f)
+                titles = [f"- {code2title.get(c, '').strip()}" for c in codes if len(code2title.get(c, '')) > 3]
+                target = "\n".join(titles)
+            else:  # discharge_dx
+                target_raw = clean_text(row.get("Discharge Diagnosis", ""))
+                target = target_raw if len(target_raw) >= 5 else ""
+            if target:
+                prompt_ids = tok(prompt, add_special_tokens=False)["input_ids"]
+                full_ids = tok(prompt + "\n" + target, add_special_tokens=False)["input_ids"]
+                prompt_lens.append(len(prompt_ids))
+                full_lens.append(len(full_ids))
+        if prompt_lens:
+            log.info(f"Prompt: mean={np.mean(prompt_lens):.1f}, max={np.max(prompt_lens)}, 95th={np.percentile(prompt_lens, 95):.1f}")
+            log.info(f"Full: mean={np.mean(full_lens):.1f}, max={np.max(full_lens)}, 95th={np.percentile(full_lens, 95):.1f}")
+        else:
+            log.warning("No valid targets found for token audit.")

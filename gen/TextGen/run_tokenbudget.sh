@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=diffsize_train
+#SBATCH --job-name=token_budget
 #SBATCH --partition=capella            # GPU partition
-#SBATCH --gres=gpu:3                   # 3 GPUs
+#SBATCH --gres=gpu:1                   # 3 GPUs
 #SBATCH --cpus-per-task=8              # CPU cores for data loading
 #SBATCH --nodes=1
 #SBATCH --mem=64G                      # RAM
 #SBATCH --time=24:00:00                # Max walltime
-#SBATCH --output=logs/train_textgen_%j.out    # stdout+stderr log
+#SBATCH --output=logs/token_budget_%j.out    # stdout+stderr log
 ## SBATCH --output=logs/%j.out    # stdout+stderr log
 
 # --- 1) Load modules ---
@@ -38,7 +38,7 @@ export CUDA_VISIBLE_DEVICES=0,1
 GPUS=${SLURM_GPUS_ON_NODE:-2}
 echo "[INFO] Using $GPUS GPUs"
 
-SCRIPT="gen/TextGen/finetune_textgen.py"
+SCRIPT="gen/TextGen/token_budget.py"
 
 # --- 6) Run training ---
 start=$(date +%s)
