@@ -80,8 +80,8 @@ TEXTGEN_OUT_ROOT=${TEXTGEN_OUT_ROOT:-runs_textgen}
 CODEGEN_OUT_ROOT=${CODEGEN_OUT_ROOT:-runs_codegen}
 
 # Script paths (point these to your integrated train/test scripts)
-TRAIN_SCRIPT=${TRAIN_SCRIPT:-train.py}    # supports --task textgen|codegen
-TEST_SCRIPT=${TEST_SCRIPT:-test.py}       # supports --task textgen|codegen
+TRAIN_SCRIPT=${TRAIN_SCRIPT:-gen/pipeline/train.py}    # supports --task textgen|codegen
+TEST_SCRIPT=${TEST_SCRIPT:-gen/pipeline/test.py}       # supports --task textgen|codegen
 
 # Training/test hyperparams (override as desired)
 EPOCHS_TEXTGEN=${EPOCHS_TEXTGEN:-4}

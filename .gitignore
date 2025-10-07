@@ -14,13 +14,20 @@ runs_base_eval_fast/
 runs_textgen
 runs_codegen
 
-# wandb logs
+## wandb logs
 wandb/
 
-# models
+## models
 models/
 
-# icd code embeddings
+## icd code embeddings
 icd_index_v9/
 
+## Analysis
 icd9_analysis_improved/
+
+# KG files:
+# KG/clinical_kg_connected_networkx.pkl
+# KG/clinical_kg_networkx.pkl
+# KG/kg_lookups.pkl
+KG/data_files/

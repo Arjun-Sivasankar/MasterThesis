@@ -2,10 +2,11 @@
 import os, time, json, argparse, datetime, inspect, torch
 from transformers import TrainingArguments, EarlyStoppingCallback, Trainer
 import pandas as pd
-from .util_codegen_core import (
+from util_codegen_core import (
     log, set_seed, is_main_process, rank0_print,
     subject_splits, nested_subject_sample, build_input_text,
-    GenCodesDataset, pad_collate, load_lm_and_tokenizer, save_json
+    GenCodesDataset, pad_collate, load_lm_and_tokenizer, save_json,
+    format_icd9_properly, is_valid_icd9
 )
 
 def get_args():
@@ -43,13 +44,21 @@ def get_args():
     ap.add_argument("--run_root", default="runs_codegen")
     ap.add_argument("--run_name", default=None)
 
+    # distributed training
+    ap.add_argument("--local_rank", type=int, default=-1)
+    
     # misc
     ap.add_argument("--compile", type=int, default=0)
     return ap.parse_args()
 
 def make_training_args(args, run_dir):
+    # Check if we're in a distributed environment but torch.distributed is not initialized
+    is_dist_env = "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1
+    dist_initialized = torch.distributed.is_available() and torch.distributed.is_initialized()
+    
+    # The distributed system is attempting to use multiple GPUs but torch.distributed is not initialized
+    # This is causing the error, so we need to set proper arguments
     TA = TrainingArguments
-    sig = inspect.signature(TA.__init__).parameters
     kwargs = dict(
         output_dir=os.path.join(run_dir, "checkpoints"),
         num_train_epochs=args.epochs,
@@ -60,6 +69,7 @@ def make_training_args(args, run_dir):
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         logging_strategy="epoch",
+        eval_strategy="epoch",
         prediction_loss_only=True,
         save_strategy="epoch",
         save_total_limit=1,
@@ -75,19 +85,38 @@ def make_training_args(args, run_dir):
         dataloader_num_workers=2,
         run_name=os.path.basename(run_dir),
         disable_tqdm=True,
+        # Explicitly set to non-distributed mode
+        local_rank=-1,
     )
-    if "eval_strategy" in sig:
-        kwargs["eval_strategy"] = "epoch"
-    elif "evaluation_strategy" in sig:
-        kwargs["evaluation_strategy"] = "epoch"
-    if "ddp_backend" in sig: kwargs["ddp_backend"] = "nccl"
-    if "ddp_find_unused_parameters" in sig: kwargs["ddp_find_unused_parameters"] = False
-    if "ddp_timeout" in sig: kwargs["ddp_timeout"] = 28800
+    
+    # This part is crucial - we need to force non-distributed training
+    # by explicitly disabling DDP-related settings
+    if hasattr(TA, "ddp_find_unused_parameters"):
+        kwargs["ddp_find_unused_parameters"] = False
+    
+    # If we're in a multi-GPU environment but not distributed, set to single-GPU
+    if is_dist_env and not dist_initialized:
+        # Force use of only one GPU by explicitly setting device
+        if torch.cuda.is_available():
+            gpu_id = int(os.environ.get("LOCAL_RANK", "0"))
+            torch.cuda.set_device(gpu_id)
+            kwargs["device"] = torch.device(f"cuda:{gpu_id}")
+            kwargs["n_gpu"] = 1
+            log.info(f"Forcing single GPU mode on device cuda:{gpu_id}")
+            
     return TA(**kwargs)
 
 def main():
     args = get_args()
     set_seed(args.seed)
+    
+    # We won't initialize distributed training - 
+    # instead we'll use a single GPU approach
+    if torch.cuda.is_available():
+        # Just use the current GPU without distributed
+        device_id = int(os.environ.get("LOCAL_RANK", "0"))
+        torch.cuda.set_device(device_id)
+        log.info(f"Using GPU {device_id} in non-distributed mode")
 
     # Load data
     if args.train_pickle and args.val_pickle:
@@ -107,7 +136,7 @@ def main():
     model, tok = load_lm_and_tokenizer(args.llama_model)
     if args.compile:
         try: model = torch.compile(model)
-        except Exception: pass
+        except Exception as e: log.warning(f"Model compilation failed: {e}")
 
     train_ds = GenCodesDataset(train_df, tok, args.max_len, args.tgt_reserve_tok, args.label_col)
     val_ds   = GenCodesDataset(val_df,   tok, args.max_len, args.tgt_reserve_tok, args.label_col)

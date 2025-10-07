@@ -7,6 +7,7 @@ from sklearn.model_selection import train_test_split
 import torch
 import torch.distributed as dist
 from transformers import TrainingArguments, Trainer, EarlyStoppingCallback
+from transformers.trainer_callback import TrainerCallback
 
 from common_textgen import (
     log, is_main_process, SFTTextGenDataset, pad_collate,
@@ -23,6 +24,53 @@ os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
 # Pick the right fabric on your cluster; exclude lo/docker
 os.environ.setdefault("NCCL_SOCKET_IFNAME", "ib,eth,^lo,docker")
+
+class LoggingCallback(TrainerCallback):
+    def __init__(self):
+        self.train_losses = []
+        self.last_epoch = -1
+        
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not is_main_process():
+            return
+            
+        logs = logs or {}
+        
+        # Handle training logs
+        if 'loss' in logs and 'eval_loss' not in logs:
+            epoch = logs.get('epoch', 0)
+            loss = logs.get('loss', 0)
+            self.train_losses.append(loss)
+            
+            # Format training progress
+            log_str = f"[TRAIN] Epoch: {epoch:.2f} | Loss: {loss:.4f}"
+            if 'learning_rate' in logs:
+                log_str += f" | LR: {logs['learning_rate']:.2e}"
+            if 'grad_norm' in logs:
+                log_str += f" | Grad: {logs['grad_norm']:.3f}"
+                
+            log.info(log_str)
+        
+        # Handle eval logs - print a summary
+        if 'eval_loss' in logs:
+            current_epoch = int(logs.get('epoch', 0))
+            if self.train_losses:
+                avg_train_loss = sum(self.train_losses) / len(self.train_losses)
+                self.train_losses = []  # Reset for next epoch
+            else:
+                avg_train_loss = float('nan')
+                
+            # Format evaluation summary
+            log_str = f"\n{'='*50}"
+            log_str += f"\n[EPOCH {current_epoch} SUMMARY]"
+            log_str += f"\n- Validation Loss: {logs['eval_loss']:.4f}"
+            log_str += f"\n- Average Training Loss: {avg_train_loss:.4f}"
+            if 'eval_runtime' in logs:
+                log_str += f"\n- Evaluation Time: {logs['eval_runtime']:.1f}s"
+            log_str += f"\n{'='*50}\n"
+                
+            log.info(log_str)
+            self.last_epoch = current_epoch
 
 def extract_codes(df, label_col):
     out=[]
@@ -110,15 +158,13 @@ def main():
     tr_subs, va_subs = train_test_split(tr_subs, test_size=0.10/0.90, random_state=args.seed)
     train_df = df[df[args.subject_col].isin(tr_subs)].copy()
     val_df   = df[df[args.subject_col].isin(va_subs)].copy()
-    test_df  = df[df[args.subject_col].isin(te_subs)].copy()
 
     # gold label space for info (not used by Trainer)
     train_gold = extract_codes(train_df, args.label_col)
     val_gold   = extract_codes(val_df, args.label_col)
-    test_gold  = extract_codes(test_df, args.label_col)
     labels_full = build_eval_labels(train_gold)
     if is_main_process():
-        log.info(f"Split sizes: train={len(train_df)} val={len(val_df)} test={len(test_df)}")
+        log.info(f"Split sizes: train={len(train_df)} val={len(val_df)}")
         log.info(f"Label space (FULL): {len(labels_full)} codes")
 
     # ---- model & tokenizer ----
@@ -184,6 +230,9 @@ def main():
     callbacks=[]
     if args.early_stop:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.patience))
+
+    # Add the custom logging callback
+    callbacks.append(LoggingCallback())
 
     trainer = SafeTrainer(
         model=model,

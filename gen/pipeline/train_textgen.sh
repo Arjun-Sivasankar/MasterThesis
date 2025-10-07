@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=textgen_train
+#SBATCH --job-name=pipe_textgen_train
 #SBATCH --partition=capella
 #SBATCH --gres=gpu:3
 #SBATCH --cpus-per-task=8
@@ -36,7 +36,7 @@ export NCCL_DEBUG=INFO
 GPUS=${SLURM_GPUS_ON_NODE:-3}
 echo "[INFO] Using $GPUS GPUs for training"
 
-SCRIPT=gen/TextGen/train_textgen.py
+SCRIPT=gen/pipeline/train_textgen.py
 
 ### 5) Paths & args (edit as needed)
 DATA_PKL=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/merged_icd9.pkl

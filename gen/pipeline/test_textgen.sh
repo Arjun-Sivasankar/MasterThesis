@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=textgen_test
+#SBATCH --job-name=pipe_textgen_test
 #SBATCH --partition=capella
 #SBATCH --gres=gpu:1               # request enough if you want multi-GPU inference
 #SBATCH --cpus-per-task=8
