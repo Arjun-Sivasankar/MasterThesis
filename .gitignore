@@ -41,3 +41,6 @@ KG/mapping_analysis/
 KG/med_analysis/
 KG/procedure_analysis/
 KG/output
+
+# HF cache
+.hf_cache/
