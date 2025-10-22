@@ -44,3 +44,14 @@ KG/output
 
 # HF cache
 .hf_cache/
+# Hugging Face / general caches
+.hf_cache/
+.cache/
+# Python caches
+**/__pycache__/
+*.pyc
+# Model/checkpoint files
+*.pt
+*.bin
+*.ckpt
+*.safetensors
