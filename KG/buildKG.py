@@ -97,7 +97,6 @@ icd9_concept_df = conso[
 print(f"ICD-9-CM concepts: {icd9_concept_df.shape[0]}")
 print(icd9_concept_df.head())
 
-# Concepts that map to ranges of ICD10CM codes are often too broad and are omitted
 icd9_concept_df = icd9_concept_df.loc[~icd9_concept_df['CODE'].str.contains('-')]
 
 # remove ICDs < 1 (procedures)

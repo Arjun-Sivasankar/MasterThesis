@@ -84,8 +84,8 @@ TRAIN_SCRIPT=${TRAIN_SCRIPT:-gen/pipeline/train.py}    # supports --task textgen
 TEST_SCRIPT=${TEST_SCRIPT:-gen/pipeline/test.py}       # supports --task textgen|codegen
 
 # Training/test hyperparams (override as desired)
-EPOCHS_TEXTGEN=${EPOCHS_TEXTGEN:-4}
-EPOCHS_CODEGEN=${EPOCHS_CODEGEN:-6}
+EPOCHS_TEXTGEN=${EPOCHS_TEXTGEN:-1}
+EPOCHS_CODEGEN=${EPOCHS_CODEGEN:-1}
 LR=${LR:-2e-4}
 GRAD_ACCUM=${GRAD_ACCUM:-16}
 PER_DEV_BS=${PER_DEV_BS:-1}
@@ -130,6 +130,7 @@ mkdir -p logs "${TEXTGEN_OUT_ROOT}" "${CODEGEN_OUT_ROOT}"
 # -------------------------------
 if [[ "$TASK" == "textgen" && "$STAGE" == "train" ]]; then
   echo "[INFO] TextGen TRAIN -> OUT=${TEXTGEN_OUT_DIR}  ADAPTER=${TEXTGEN_ADAPTER_DIR}"
+  echo "[INFO] Training for $EPOCHS_TEXTGEN epochs"
   srun torchrun --standalone --nproc_per_node=${GPUS} "${TRAIN_SCRIPT}" \
     --task textgen \
     --data_pickle "${DATA_PKL}" \
@@ -194,6 +195,7 @@ fi
 # -------------------------------
 if [[ "$TASK" == "codegen" && "$STAGE" == "train" ]]; then
   echo "[INFO] CodeGen TRAIN -> RUN_ROOT=${CODEGEN_RUN_ROOT} RUN_NAME=${CODEGEN_RUN_NAME}"
+  echo "[INFO] Training for $EPOCHS_CODEGEN epochs"
   srun python "${TRAIN_SCRIPT}" \
     --task codegen \
     --data_pickle "${DATA_PKL}" \

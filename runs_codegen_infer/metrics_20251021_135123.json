@@ -1,0 +1,122 @@
+{
+  "FULL": {
+    "RAW": {
+      "micro_f1": 0.22296367125777336,
+      "macro_f1": 0.01521031520313951,
+      "samples_f1": 0.21978280498677996,
+      "micro_precision": 0.30056862852650246,
+      "macro_precision": 0.02666624033896757,
+      "samples_precision": 0.31792855820461363,
+      "micro_recall": 0.17720932238104478,
+      "macro_recall": 0.014976608387851812,
+      "samples_recall": 0.19580045889366712,
+      "parent_micro_precision": 0.5542058468405839,
+      "parent_micro_recall": 0.3550799381124291,
+      "parent_micro_f1": 0.43283944619868836
+    },
+    "KG": {
+      "micro_f1": 0.2229024004560663,
+      "macro_f1": 0.015209319029671941,
+      "samples_f1": 0.2197378683301414,
+      "micro_precision": 0.3008739304886316,
+      "macro_precision": 0.026670002680417037,
+      "samples_precision": 0.31793994691808786,
+      "micro_recall": 0.1770260655843736,
+      "macro_recall": 0.014967035811489563,
+      "samples_recall": 0.1956858526172679,
+      "parent_micro_precision": 0.5546104491292392,
+      "parent_micro_recall": 0.3546110928782409,
+      "parent_micro_f1": 0.4326140734703216
+    }
+  },
+  "DATASET": {
+    "RAW": {
+      "micro_f1": 0.22524577809748914,
+      "macro_f1": 0.11148150063430488,
+      "samples_f1": 0.222113593766643,
+      "micro_precision": 0.30900956784901973,
+      "macro_precision": 0.19544581749690076,
+      "samples_precision": 0.3268943097539,
+      "micro_recall": 0.17720932238104478,
+      "macro_recall": 0.10976858501560952,
+      "samples_recall": 0.19580045889366712,
+      "parent_micro_precision": 0.5540614244607023,
+      "parent_micro_recall": 0.34530451497960524,
+      "parent_micro_f1": 0.42545509686829813
+    },
+    "KG": {
+      "micro_f1": 0.22517482517482518,
+      "macro_f1": 0.11147419934491189,
+      "samples_f1": 0.22206563007527352,
+      "micro_precision": 0.30930048593061366,
+      "macro_precision": 0.1954733929590186,
+      "samples_precision": 0.3269031241691046,
+      "micro_recall": 0.1770260655843736,
+      "macro_recall": 0.10969842439345624,
+      "samples_recall": 0.1956858526172679,
+      "parent_micro_precision": 0.5544416387140542,
+      "parent_micro_recall": 0.34485911200712643,
+      "parent_micro_f1": 0.425228714717232
+    }
+  },
+  "TOP50": {
+    "RAW": {
+      "micro_f1": 0.31689696575021875,
+      "macro_f1": 0.26341831318278397,
+      "samples_f1": 0.24170358874674328,
+      "micro_precision": 0.5033943233982027,
+      "macro_precision": 0.4863328509880872,
+      "samples_precision": 0.3812390456658341,
+      "micro_recall": 0.23123069612734617,
+      "macro_recall": 0.22937846157688507,
+      "samples_recall": 0.20553632412316,
+      "parent_micro_precision": 0.5396353291090134,
+      "parent_micro_recall": 0.2513325503658867,
+      "parent_micro_f1": 0.3429416719741951
+    },
+    "KG": {
+      "micro_f1": 0.31668974505172276,
+      "macro_f1": 0.26330461272357253,
+      "samples_f1": 0.24162727146863833,
+      "micro_precision": 0.5037574501166106,
+      "macro_precision": 0.48649811320800346,
+      "samples_precision": 0.3812393009575202,
+      "micro_recall": 0.23093371347113328,
+      "macro_recall": 0.2290019183899401,
+      "samples_recall": 0.20539224535067155,
+      "parent_micro_precision": 0.5397473275024296,
+      "parent_micro_recall": 0.2508808383774505,
+      "parent_micro_f1": 0.34254348094239545
+    }
+  },
+  "BOT50": {
+    "RAW": {
+      "micro_f1": 0.08588957055214724,
+      "macro_f1": 0.06309090909090909,
+      "samples_f1": 0.0008577800651912849,
+      "micro_precision": 0.09210526315789473,
+      "macro_precision": 0.06577777777777778,
+      "samples_precision": 0.0008363355635615028,
+      "micro_recall": 0.08045977011494253,
+      "macro_recall": 0.08999999999999998,
+      "samples_recall": 0.0009006690684508493,
+      "parent_micro_precision": 0.09210526315789473,
+      "parent_micro_recall": 0.08045977011494253,
+      "parent_micro_f1": 0.08588957055214724
+    },
+    "KG": {
+      "micro_f1": 0.08588957055214724,
+      "macro_f1": 0.06309090909090909,
+      "samples_f1": 0.0008577800651912849,
+      "micro_precision": 0.09210526315789473,
+      "macro_precision": 0.06577777777777778,
+      "samples_precision": 0.0008363355635615028,
+      "micro_recall": 0.08045977011494253,
+      "macro_recall": 0.08999999999999998,
+      "samples_recall": 0.0009006690684508493,
+      "parent_micro_precision": 0.09210526315789473,
+      "parent_micro_recall": 0.08045977011494253,
+      "parent_micro_f1": 0.08588957055214724
+    }
+  }
+}

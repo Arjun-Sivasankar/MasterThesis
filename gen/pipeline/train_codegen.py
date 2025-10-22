@@ -1,6 +1,7 @@
 # pipelines/train_codegen.py
 import os, time, json, argparse, datetime, inspect, torch
 from transformers import TrainingArguments, EarlyStoppingCallback, Trainer
+from transformers.trainer_callback import TrainerCallback
 import pandas as pd
 from util_codegen_core import (
     log, set_seed, is_main_process, rank0_print,
@@ -8,6 +9,58 @@ from util_codegen_core import (
     GenCodesDataset, pad_collate, load_lm_and_tokenizer, save_json,
     format_icd9_properly, is_valid_icd9
 )
+
+# ---- Logging callback with clearer summaries ----
+class LoggingCallback(TrainerCallback):
+    def __init__(self):
+        self.train_losses = []
+        self.last_epoch = -1
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not is_main_process():
+            return
+        logs = logs or {}
+
+        # Per-step training logs
+        if 'loss' in logs and 'eval_loss' not in logs:
+            epoch = logs.get('epoch', 0)
+            loss = logs.get('loss', 0)
+            self.train_losses.append(float(loss))
+            # Compose
+            parts = [f"[TRAIN] Epoch {epoch:.2f}", f"Loss {loss:.4f}"]
+            if 'learning_rate' in logs:
+                parts.append(f"LR {logs['learning_rate']:.2e}")
+            if 'grad_norm' in logs:
+                parts.append(f"Grad {logs['grad_norm']:.3f}")
+            log.info(" | ".join(parts))
+
+        # Per-eval logs (end of epoch if evaluation_strategy='epoch')
+        if 'eval_loss' in logs:
+            current_epoch = int(logs.get('epoch', 0))
+            if self.train_losses:
+                avg_train_loss = sum(self.train_losses) / len(self.train_losses)
+                self.train_losses = []
+            else:
+                avg_train_loss = float('nan')
+
+            eval_loss = float(logs['eval_loss'])
+            try:
+                ppl = float(np.exp(min(eval_loss, 20)))  # clamp for safety
+            except Exception:
+                ppl = float('nan')
+
+            lines = [
+                "\n" + "="*56,
+                f"[EPOCH {current_epoch} SUMMARY]",
+                f"- Avg Train Loss: {avg_train_loss:.4f}",
+                f"- Val Loss:       {eval_loss:.4f}",
+                f"- Val Perplexity: {ppl:.2f}",
+            ]
+            if 'eval_runtime' in logs:
+                lines.append(f"- Eval Time:     {logs['eval_runtime']:.1f}s")
+            lines.append("="*56 + "\n")
+            log.info("\n".join(lines))
+            self.last_epoch = current_epoch
 
 def get_args():
     ap = argparse.ArgumentParser()
@@ -148,9 +201,11 @@ def main():
         rank0_print(f"Run dir: {run_dir}")
 
     train_args = make_training_args(args, run_dir)
+
     callbacks = []
     if args.early_stop:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.patience))
+    callbacks.append(LoggingCallback())
 
     trainer = Trainer(
         model=model,

@@ -7,8 +7,10 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model
+from transformers.utils import logging as hf_logging
 
 # ---------------- logging ----------------
+hf_logging.set_verbosity_error()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 log = logging.getLogger(__name__)
 
@@ -25,17 +27,32 @@ def set_seed(seed=42):
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 # ---------------- ICD-9 helpers ----------------
+# def format_icd9_properly(code: str) -> str:
+#     code = str(code).strip().upper()
+#     code = re.sub(r"\s+", "", code)
+#     if code.endswith("."):
+#         code = code[:-1]
+#     if code and code[0].isdigit():
+#         if '.' not in code and len(code) > 3:
+#             return code[:3] + '.' + code[3:]
+#     elif code and len(code) > 1:
+#         if code[0] in ('V', 'E') and '.' not in code and len(code) > 3:
+#             return code[:3] + '.' + code[3:]
+#     return code
+
 def format_icd9_properly(code: str) -> str:
-    code = str(code).strip().upper()
-    code = re.sub(r"\s+", "", code)
-    if code.endswith("."):
-        code = code[:-1]
-    if code and code[0].isdigit():
-        if '.' not in code and len(code) > 3:
-            return code[:3] + '.' + code[3:]
-    elif code and len(code) > 1:
-        if code[0] in ('V', 'E') and '.' not in code and len(code) > 3:
-            return code[:3] + '.' + code[3:]
+    """Format ICD-9 code properly with decimal placement"""
+    code = re.sub(r"\s+","", str(code)).upper().rstrip(".")
+    if not code: return ""
+    if code[0].isdigit():
+        if len(code)>3 and "." not in code: return code[:3]+"."+code[3:]
+        return code
+    if code[0] == "V":
+        if len(code)>3 and "." not in code: return code[:3]+"."+code[3:]
+        return code
+    if code[0] == "E":
+        if len(code)>4 and "." not in code: return code[:4]+"."+code[4:]
+        return code
     return code
 
 def is_valid_icd9(code: str) -> bool:

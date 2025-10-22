@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/test_textgen_%j.out
+#SBATCH --output=logs/Textgen/test_textgen_%j.out
 
 ### 1) Modules
 module purge
@@ -30,13 +30,16 @@ export NCCL_SOCKET_IFNAME="ib,eth,^lo,docker"
 export NCCL_DEBUG=INFO
 
 ### 5) Paths & args (edit as needed)
-SCRIPT=gen/TextGen/test_textgen.py
+# SCRIPT=gen/TextGen/test_textgen.py
+SCRIPT=gen/pipeline/test_textgen.py
 DATA_PKL=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/merged_icd9.pkl
 ICD_INDEX=./gen/TextGen/icd_index_v9
 BASE_LLM=meta-llama/Llama-3.2-1B-Instruct
-ADAPTER_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs/runs_textgen/checkpoints/checkpoint-11694
-TMP_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs/runs_textgen/checkpoints/checkpoint-11694/test_shards
-OUT_METRICS=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs/runs_textgen/test_metrics.json
+# ADAPTER_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs/runs_textgen/checkpoints/checkpoint-11694
+ADAPTER_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs_textgen/adapter_v1
+# TMP_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs/runs_textgen/checkpoints/checkpoint-11694/test_shards
+TMP_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs_textgen/adapter_v1/test_shards
+OUT_METRICS=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/runs_textgen/adapter_v1/test_metrics.json
 
 # Decoding config
 DECODING=greedy      # greedy | beam | sample

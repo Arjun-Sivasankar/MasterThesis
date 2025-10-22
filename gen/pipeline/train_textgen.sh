@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/train_textgen_%j.out
+#SBATCH --output=logs/Textgen/train_textgen_%j.out
 
 ### 1) Modules
 module purge
@@ -41,9 +41,15 @@ SCRIPT=gen/pipeline/train_textgen.py
 ### 5) Paths & args (edit as needed)
 DATA_PKL=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/merged_icd9.pkl
 ICD_INDEX=./gen/TextGen/icd_index_v9
-BASE_LLM=meta-llama/Llama-3.2-1B-Instruct
 OUT_DIR=runs_textgen/checkpoints
 ADAPTER_DIR=runs_textgen/adapter_v1
+
+EPOCHS=10
+echo "[INFO] Training for Epochs: ${EPOCHS}"
+
+# BASE_LLM=meta-llama/Llama-3.2-1B-Instruct
+BASE_LLM=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/Llama-3.1-8B-Instruct
+echo "[INFO] Using base LLM: ${BASE_LLM}"
 
 ### 6) Run: multi-GPU training (DDP) via torchrun
 start=$(date +%s)
@@ -56,7 +62,7 @@ srun torchrun --standalone --nproc_per_node=${GPUS} ${SCRIPT} \
   --llm "${BASE_LLM}" \
   --target_mode icd_titles \
   --icd_index_dir "${ICD_INDEX}" \
-  --epochs 4 \
+  --epochs ${EPOCHS} \
   --per_device_train_batch_size 1 \
   --per_device_eval_batch_size 1 \
   --grad_accum 16 \

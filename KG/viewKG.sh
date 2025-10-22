@@ -20,7 +20,8 @@ cd /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis || { echo "Project dir n
 source /data/horse/ws/arsi805e-venv/venvs/finetune/bin/activate
 echo "[INFO] Virtual env loaded: $VIRTUAL_ENV"
 
-python KG/viewKG.py
+# python KG/viewKG.py
+python KG/LabtestLOINCMap.py
 
 status=$?
 echo "[INFO] Job finished with exit code $status"

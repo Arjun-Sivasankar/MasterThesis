@@ -6,8 +6,8 @@
 #SBATCH --nodes=1
 #SBATCH --mem=64G                      # RAM
 #SBATCH --time=24:00:00                # Max walltime
-#SBATCH --output=logs/train_ddp_%j.out    # stdout+stderr log
-## SBATCH --output=logs/%j.out    # stdout+stderr log
+#SBATCH --output=logs/CodeGen-DDP/train_ddp_%j.out    # stdout+stderr log
+## SBATCH --output=logs/CodeGen-DDP/%j.out    # stdout+stderr log
 
 # --- 1) Load modules ---
 module purge
@@ -41,6 +41,13 @@ echo "[INFO] Using $GPUS GPUs"
 SCRIPT="gen/finetune_llama_gen_ddp.py"
 echo "[INFO] Script to be run: $SCRIPT"
 
+EPOCHS=10
+echo "[INFO] Training for $EPOCHS epoch(s)"
+
+LLM=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/Llama-3.1-8B-Instruct
+# LLM=meta-llama/Llama-3.2-1B-Instruct
+echo "[INFO] Using LLM model: ${LLM}"
+
 # --- 6) Run training ---
 start=$(date +%s)
 echo "[INFO] Job started at $(date)"
@@ -51,14 +58,14 @@ srun torchrun --standalone --nproc_per_node=${GPUS} ${SCRIPT} \
     --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/val_df.pkl \
     --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/test_df.pkl \
     --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
-    --llama_model /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/llama3-8b-instruct \
+    --llama_model /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/Llama-3.1-8B-Instruct \
     --train_size 54981 \
     --eval_sample_size 100 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --test_batch_size 16 \
     --grad_accum 16 \
-    --epochs 6 \
+    --epochs ${EPOCHS} \
     --use_complete_icd9 1
 
 

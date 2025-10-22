@@ -31,3 +31,13 @@ icd9_analysis_improved/
 # KG/clinical_kg_networkx.pkl
 # KG/kg_lookups.pkl
 KG/data_files/
+KG/cache/
+KG/coverage_analysis/   
+KG/kg_output/
+KG/kg_output2/
+KG/kg_output3/
+KG/lab_test_analysis/
+KG/mapping_analysis/
+KG/med_analysis/
+KG/procedure_analysis/
+KG/output
