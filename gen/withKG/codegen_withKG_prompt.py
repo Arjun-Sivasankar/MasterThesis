@@ -2,8 +2,6 @@
 # -*- coding: utf-8 -*-
 
 """
-KG-in-prompt codegen (adapter-only) with rich neighbor lines + KG-first budgeting.
-
 - RAW prompt:   [VISIT] + structured + NOTES + [TASK/CODES]
 - KG  prompt:   RAW + [KG HINTS] block that shows:
     * Evidence CUIs by source (ATC/PROC/LOINC)
