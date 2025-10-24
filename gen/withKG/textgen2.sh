@@ -20,23 +20,18 @@ python -V
 # 1) Paths
 PROJECT_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis
 cd "$PROJECT_DIR" || { echo "Project dir not found: $PROJECT_DIR"; exit 1; }
-mkdir -p logs/textgenKGprompt runs_textgen/test_shards
 
-SCRIPT=gen/withKG/textgen_withKG_prompt.py
+SCRIPT=gen/withKG/textgen_withKG_prompt2.py
 echo "Running script: $SCRIPT"
 
-# Data (use your test split or full set with --test_only/--subset_n below)
-DATA_PKL=$PROJECT_DIR/dataset/icd9/test_df.pkl
-
-# ICDMapper FAISS/index dir
-INDEX_DIR=$PROJECT_DIR/icd_index_v9
+DATA_PKL=$PROJECT_DIR/dataset/icd9/test_df.pkl     # or your test set if you prefer
+INDEX_DIR=$PROJECT_DIR/icd_index_v9                # ICDMapper FAISS/index dir
 
 # Base + LoRA (adapter-only)
 BASE_MODEL=$PROJECT_DIR/models/Llama-3.1-8B-Instruct
-# BASE_MODEL=meta-llama/Llama-3.2-1B-Instruct
 ADAPTER_DIR=$PROJECT_DIR/runs_textgen/adapter_v1
 
-# KG & maps (ATC fetched from 'ndc' column)
+# KG & maps (ATC fetched from 'ndc' col)
 KG_DIR=$PROJECT_DIR/KG/kg_output2
 KG_PKL=$KG_DIR/medical_knowledge_graph.pkl
 DX_MAP=$KG_DIR/code2cui_icd9_dx.pkl
@@ -47,22 +42,21 @@ ATC_MAP=$KG_DIR/code2cui_atc.pkl
 # Optional code lists
 TOP_CODES=$PROJECT_DIR/icd9_analysis_improved/top_50_codes.csv
 BOT_CODES=$PROJECT_DIR/icd9_analysis_improved/bottom_50_codes.csv
-TOP_PARENTS=""    # leave blank if unused
+TOP_PARENTS=""    # leave blank for now
 
 # 2) Env
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export HF_HOME=$PROJECT_DIR/.hf_cache
 
 GPUS=${SLURM_GPUS_ON_NODE:-1}
 echo "[INFO] Using $GPUS GPU(s)"
 
-# 3) Budgets (from your token-budget helper)
-TOTAL_INPUT_BUDGET=3072
-ASSISTANT_RESERVE=128
-NOTES_SOFT_BUDGET=2307   # ~p95 split for notes
-KG_SOFT_BUDGET=637       # ~p95 split for KG block
+# 3) Budgets (from your p95 summaries; give KG more room)
+TOTAL_INPUT_BUDGET=4096     # you can try 4096 to give notes/KG more headroom
+ASSISTANT_RESERVE=256
+NOTES_SOFT_BUDGET=3008
+KG_SOFT_BUDGET=832
 
 echo "[INFO] Using budgets - Total: $TOTAL_INPUT_BUDGET, Assistant reserve: $ASSISTANT_RESERVE, Notes soft: $NOTES_SOFT_BUDGET, KG soft: $KG_SOFT_BUDGET"
 
@@ -74,13 +68,20 @@ BATCH_SIZE=8
 
 # 5) KG expansion
 HOP=1
-MAX_NEIGHBORS_SHOW=24
 REL_WHITELIST=""
 RELA_WHITELIST=""
+MAX_NEIGHBORS_SHOW=24
 
-# 6) Quick test controls
-SUBSET_N=0          # set 0 to run all rows
+# 6) Run size
+TEST_ONLY=--test_only        # or blank to do subject split
+SUBSET_N=0                   # set 0 to run all
 PRINT_SAMPLES=5
+
+# 7) ICD Mapper settings
+w_cos=1.0
+w_fuz=0.0
+
+echo "[INFO] Using ICD Mapper weights - Cosine: $w_cos, Fuzzy: $w_fuz"
 
 OUT_JSON=$PROJECT_DIR/runs_textgen/test_metrics_raw_vs_kg.json
 TMP_DIR=$PROJECT_DIR/runs_textgen/test_shards
@@ -88,10 +89,10 @@ TMP_DIR=$PROJECT_DIR/runs_textgen/test_shards
 echo "[INFO] Starting at: $(date)"
 PYTHONUNBUFFERED=1 python "$SCRIPT" \
   --data_pickle "$DATA_PKL" \
-  --test_only \
+  $TEST_ONLY \
   --subset_n $SUBSET_N \
   --print_samples $PRINT_SAMPLES \
-  --N_max_terms 12 \
+  --N_max_terms 0 \
   --total_input_budget $TOTAL_INPUT_BUDGET \
   --assistant_reserve $ASSISTANT_RESERVE \
   --notes_soft_budget $NOTES_SOFT_BUDGET \
@@ -109,14 +110,16 @@ PYTHONUNBUFFERED=1 python "$SCRIPT" \
   --loinc_map_pkl "$LOINC_MAP" \
   --atc_map_pkl "$ATC_MAP" \
   --hop $HOP \
-  --max_neighbors_show $MAX_NEIGHBORS_SHOW \
   --rel_whitelist "$REL_WHITELIST" \
   --rela_whitelist "$RELA_WHITELIST" \
+  --max_neighbors_show $MAX_NEIGHBORS_SHOW \
   --top_codes_csv "$TOP_CODES" \
   --bottom_codes_csv "$BOT_CODES" \
   --top_parent_csv "$TOP_PARENTS" \
   --tmp_dir "$TMP_DIR" \
-  --out_metrics "$OUT_JSON"
+  --out_metrics "$OUT_JSON" \
+  --w_cos $w_cos \
+  --w_fuz $w_fuz
 
 EXIT_CODE=$?
 echo "[INFO] Finished at: $(date)"

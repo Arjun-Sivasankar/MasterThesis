@@ -337,8 +337,7 @@
 # -*- coding: utf-8 -*-
 """
 train_codegen.py — HF Trainer with rich logging (train/eval loss summaries),
-solid DDP teardown, and safe adapter saving. Mirrors your improved textgen
-trainer but fixes a few rough edges (notably 'evaluation_strategy').
+solid DDP teardown, and safe adapter saving.
 """
 
 import os, json, time, argparse, logging, pickle, sys

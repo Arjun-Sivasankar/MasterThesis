@@ -6,9 +6,9 @@ TextGen with KG hints in the prompt (adapter-only), evaluated RAW vs KG.
 
 Pipeline:
 1) Build two prompts per row:
-   - RAW : [VISIT]+structured+NOTES + [TASK/FORMAT/OUTPUT]
-   - KG  : same + [KG HINTS] (visit evidence → CUIs → 0/1/2-hop → candidate ICD-9),
-           all under a token budget so it fits within total_input_budget - assistant_reserve.
+   - RAW:   [VISIT]+structured+NOTES + [TASK/FORMAT/OUTPUT]
+   - KG  :  same + [KG HINTS] (visit evidence → CUIs → 0/1/2-hop → ranked candidate ICD-9),
+            all under a token budget so it fits within total_input_budget - assistant_reserve.
 2) Generate free-text diagnoses for RAW and KG with identical decoding.
 3) Extract lines AFTER [OUTPUT] and treat them as free-text terms.
 4) Map terms → ICD-9 via your ICDMapper.
@@ -19,11 +19,12 @@ Notes:
 - Your dataset stores ATC in the 'ndc' column; we use ATC map directly.
 - We *show ICD-9 codes in the KG context* to bias the LM, but we still instruct
   the model to output plain-text diagnoses — mapping happens afterwards.
+- pro_code examples like 'PRO_5491' are normalized to ICD-9-Proc '54.91'.
 """
 
-import os, re, json, time, argparse, pickle, glob, sys
+import os, re, json, time, argparse, pickle, glob, sys, math
 from typing import List, Dict, Set, Tuple
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 import numpy as np
 import pandas as pd
@@ -168,102 +169,101 @@ def trim_to_token_budget(tok, text: str, max_tokens: int) -> str:
             hi = mid - 1
     return best
 
-# ------------------------------- Evidence helpers -------------------------------
-def _strip(x: str) -> str:
-    return str(x).strip().upper()
+# ------------------------------- Evidence & KG plumbing -------------------------------
+def _strip(x) -> str:
+    return str(x).strip().upper().replace(" ", "")
 
-def format_icd9_proc(code: str) -> str:
+def format_icd9_proc_from_pro(c: str) -> str:
     """
-    Normalize ICD-9-CM procedure codes.
-
-    Examples:
-      "PRO_5491"  -> "54.91"
-      "pro-549"   -> "54.9"
-      "54.91"     -> "54.91"
-      "PRO_54"    -> "54"
+    Convert things like 'PRO_5491' -> '54.91'.
     """
-    s = str(code).strip().upper()
-
-    # remove common "PRO_" prefix variants
-    s = re.sub(r'^PRO[\s_:\-]*', '', s)
-
-    # keep only digits and dots
-    s = re.sub(r'[^0-9\.]', '', s)
-
-    # if already dotted, lightly validate and return
-    if '.' in s:
-        # ensure at least two digits before the dot; leave rest as-is
-        m = re.match(r'^(\d{2,})\.(\d+)$', s)
-        if m:
-            left, right = m.groups()
-            # clamp right side to at most 2 digits for ICD-9-Proc convention
-            return f"{left[:2]}.{right[:2]}"
-        # if it's something like "5.4" -> pad/normalize to "54" or "54.x"
-        s = re.sub(r'\.', '', s)  # fall through to re-dot logic
-
-    # re-dot after first two digits
-    digits = re.sub(r'\D', '', s)
-    if len(digits) <= 2:
-        return digits  # e.g., "54"
-    # up to two digits after the dot (ICD-9-Proc usually 2.xx)
-    return f"{digits[:2]}.{digits[2:4]}"
+    s = _strip(c)
+    if s.startswith("PRO_"): s = s[4:]
+    s = re.sub(r"[^0-9]", "", s)  # keep digits only
+    if not s: return ""
+    if len(s) >= 3:
+        return s[:2] + "." + s[2:]
+    return s
 
 def visit_evidence_cuis(row: pd.Series,
                         icd9_proc_map: Dict[str, List[str]],
                         loinc_map: Dict[str, List[str]],
-                        atc_map: Dict[str, List[str]]) -> Tuple[Dict[str, List[str]], Set[str]]:
+                        atc_map: Dict[str, List[str]]) -> Tuple[Dict[str,List[str]], Set[str]]:
     """
     Returns:
       src2cuis: { "ATC:XXX": [...], "LNC:YYY":[...], "PROC:12.34":[...] }
       ev_union: set(CUIs)
-    Notes:
-      - ATC comes from 'ndc' column in your dataset (already ATC codes).
-      - LOINC from 'lab_test'.
-      - ICD-9 PROC from 'pro_code'.
     """
-    src2cuis: Dict[str, List[str]] = {}
-    ev_union: Set[str] = set()
+    src2cuis = {}
+    ev = set()
 
     # ATC via 'ndc'
     for c in to_list(row.get("ndc", [])):
         key = _strip(c)
-        if not key:
-            continue
         cuis = atc_map.get(key, [])
         if cuis:
             src2cuis[f"ATC:{key}"] = cuis
-            ev_union.update(cuis)
+            ev.update(cuis)
 
-    # LOINC
+    # LOINC via 'lab_test'
     for c in to_list(row.get("lab_test", [])):
         key = _strip(c)
-        if not key:
-            continue
         cuis = loinc_map.get(key, [])
         if cuis:
             src2cuis[f"LNC:{key}"] = cuis
-            ev_union.update(cuis)
+            ev.update(cuis)
 
-    # ICD-9 PROC
+    # ICD-9 PROC via 'pro_code'
     for c in to_list(row.get("pro_code", [])):
-        cc = format_icd9_proc(c)
-        if not cc:
-            continue
+        cc = format_icd9_proc_from_pro(c)
+        if not cc: continue
         cuis = icd9_proc_map.get(cc, [])
         if cuis:
             src2cuis[f"PROC:{cc}"] = cuis
-            ev_union.update(cuis)
+            ev.update(cuis)
 
-    return src2cuis, ev_union
+    return src2cuis, ev
 
-# ------------------------------- KG plumbing (neighbors + allowed codes) -------------------------------
+def expand_cuis(G: nx.DiGraph,
+                seeds: Set[str],
+                hop: int,
+                rel_whitelist: Set[str] = None,
+                rela_whitelist: Set[str] = None) -> Set[str]:
+    if hop <= 0 or not seeds or G is None:
+        return set(seeds)
+    frontier = set(seeds); visited = set(seeds)
+    for _ in range(hop):
+        nxt=set()
+        for u in frontier:
+            if u not in G: continue
+            for v in G.successors(u):
+                d = G[u][v]
+                rel  = (d.get("rel")  or "").strip()
+                rela = (d.get("rela") or "").strip()
+                if rel_whitelist  and rel  not in rel_whitelist:   continue
+                if rela_whitelist and rela not in rela_whitelist:   continue
+                if v not in visited: nxt.add(v)
+        visited |= nxt
+        frontier = nxt
+        if not frontier: break
+    return visited
+
+def allowed_icd9_from_cuis(dx_map: Dict[str, List[str]], bag_cuis: Set[str]) -> List[str]:
+    if not bag_cuis: return []
+    allowed=[]
+    for code, cuis in dx_map.items():
+        if bag_cuis.intersection(cuis):
+            c = format_icd9(code)
+            if is_valid_icd9(c): allowed.append(c)
+    return sorted(set(allowed))
+
 def render_neighbors_block(G: nx.DiGraph,
                            ev_cuis: Set[str],
                            hop: int,
                            rel_whitelist: Set[str] = None,
                            rela_whitelist: Set[str] = None,
                            max_neighbors_show: int = 24) -> Tuple[Set[str], str]:
-    """Return (expanded_cuis, neighbor_text_block) with 'u [name] --rel/rela--> v [name]' lines."""
+    """Return (expanded_cuis, neighbor_text_block) with 'u [name] --rel--> v [name]' lines."""
     if hop <= 0 or not ev_cuis:
         return set(ev_cuis), ""
     seen=set(ev_cuis); frontier=set(ev_cuis); edges=[]
@@ -281,100 +281,129 @@ def render_neighbors_block(G: nx.DiGraph,
                 if len(edges) < max_neighbors_show:
                     nmu = G.nodes[u].get("name","Unknown") if u in G else "Unknown"
                     nmv = G.nodes[v].get("name","Unknown") if v in G else "Unknown"
-                    label = (rela if rela else rel)
-                    edges.append(f"- {u} [{nmu}] --{label}--> {v} [{nmv}]")
+                    edges.append(f"- {u} [{nmu}] --{(rela if rela else rel)}--> {v} [{nmv}]")
                 nxt.add(v)
         nxt -= seen
         seen |= nxt
         frontier = nxt
         if not frontier: break
     if edges:
-        block = f"Neighbors within {hop} hop(s):\n" + "\n".join(edges)
+        block = "Neighbors within %d hop(s):\n" % hop
+        block += "\n".join(edges)
         return seen, block
     return seen, ""
 
-def allowed_icd9_from_cuis(dx_map: Dict[str, List[str]], bag_cuis: Set[str]) -> List[str]:
-    """Return ICD-9 diagnoses whose CUI list intersects bag_cuis (sorted)."""
-    if not bag_cuis: return []
-    allowed=[]
-    for code, cuis in dx_map.items():
-        if bag_cuis.intersection(cuis):
-            c = format_icd9(code)
-            if is_valid_icd9(c): allowed.append(c)
-    return sorted(set(allowed))
+# ------------------------------- Candidate ranking & priors -------------------------------
+_HISTORY_PAT = re.compile(r"\b(history of|family history)\b", re.I)
+_EXTERNAL_PAT = re.compile(r"\b(accident|trauma|injury|fall|assault)\b", re.I)
 
+def extract_note_cues(text: str) -> Set[str]:
+    s = (text or "").lower()
+    cues=set()
+    if _HISTORY_PAT.search(s): cues.add("history")
+    if _EXTERNAL_PAT.search(s): cues.add("external")
+    return cues
+
+def build_code_prior(gold_lists: List[List[str]]) -> Counter:
+    return Counter([c for lst in gold_lists for c in lst])
+
+def top_prior_codes(code_prior: Counter, k: int = 50) -> List[str]:
+    return [c for (c,_) in code_prior.most_common(k)]
+
+def rank_candidates(allowed_codes: List[str],
+                    icd9_dx_map: Dict[str, List[str]],
+                    ev_cuis: Set[str],
+                    nb_cuis: Set[str],
+                    note_cues: Set[str] = None,
+                    code_prior: Counter = None,
+                    w_ev: float = 3.0,
+                    w_nb: float = 1.0,
+                    w_typ: float = 1.0,
+                    w_freq: float = 0.2) -> List[str]:
+    """
+    Score = w_ev*|C∩ev| + w_nb*|C∩nb| + type bonus/penalty + weak prior.
+    Works even when ev/nb are empty (then score falls back to type + prior).
+    """
+    def type_bonus(code: str) -> float:
+        # Penalize V/E unless supported by cues in the notes
+        if code.startswith("V"):
+            return 0.0 if (note_cues and "history" in note_cues) else -1.5
+        if code.startswith("E"):
+            return 0.0 if (note_cues and "external" in note_cues) else -1.5
+        return 0.0
+
+    ev_cuis = ev_cuis or set()
+    nb_cuis = nb_cuis or set()
+
+    scored=[]
+    for c in allowed_codes:
+        cuis = set(icd9_dx_map.get(c, []))
+        s = 0.0
+        if ev_cuis:
+            s += w_ev * len(cuis & ev_cuis)
+        if nb_cuis:
+            s += w_nb * len(cuis & nb_cuis)
+        s += w_typ * type_bonus(c)
+        if code_prior:
+            s += w_freq * math.log1p(code_prior.get(c, 0))
+        scored.append((s, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored]
+
+# ------------------------------- KG hints text -------------------------------
 def build_kg_hints_text(allowed_codes: List[str],
-                        src2cuis: Dict[str, List[str]],
+                        evid_raw: Dict[str, List[str]],
                         tok,
                         kg_soft_budget: int,
-                        neighbors_block: str = None) -> str:
+                        neighbors_block: str = None,
+                        evidence_cuis_block: str = None) -> str:
     """
-    Compose [KG HINTS] with:
-      • Evidence lines: each source → its CUIs (budgeted)
-      • Optional neighbors block (already formatted)
-      • Candidate ICD-9 list (context only)
-    All clamped to kg_soft_budget tokens.
+    Build the textual KG hints block under a soft token budget.
+    Include evidence sources, optional neighbor edges, and candidate ICD-9 codes.
     """
-    if kg_soft_budget <= 0:
-        return ""
+    if kg_soft_budget <= 0: return ""
+    lines = ["[KG HINTS]"]
+    if evid_raw.get("ATC"):   lines.append("EVIDENCE ATC: "   + " ".join(evid_raw["ATC"][:10]))
+    if evid_raw.get("PROC"):  lines.append("EVIDENCE PROC: "  + " ".join(evid_raw["PROC"][:10]))
+    if evid_raw.get("LOINC"): lines.append("EVIDENCE LOINC: " + " ".join(evid_raw["LOINC"][:10]))
 
-    sections = ["[KG HINTS]"]
+    # Try to include neighbor edges and a compact CUI evidence block
+    head = "\n".join(lines)
+    for extra in [neighbors_block, evidence_cuis_block]:
+        if extra:
+            trial = head + "\n" + extra
+            if count_tokens(tok, trial) <= kg_soft_budget:
+                head = trial
 
-    # Evidence CUIs (compact, budget-aware)
-    if src2cuis:
-        sections.append("Evidence CUIs linked from visit data:")
-        def _sort_key(k: str):
-            if k.startswith("ATC:"):  return (0, k)
-            if k.startswith("PROC:"): return (1, k)
-            if k.startswith("LNC:"):  return (2, k)
-            return (3, k)
-        for src in sorted(src2cuis.keys(), key=_sort_key):
-            cuis = list(dict.fromkeys([str(x) for x in src2cuis[src]]))  # de-dup keep order
-            head = "\n".join(sections) + "\n- " + src + " -> "
-            kept = []
-            for cu in cuis:
-                trial = head + " ".join(kept + [cu])
-                if count_tokens(tok, trial) <= kg_soft_budget:
-                    kept.append(cu)
-                else:
-                    break
-            if kept:
-                sections.append(f"- {src} -> " + " ".join(kept))
-            else:
-                trial_line = head.strip()
-                if count_tokens(tok, trial_line) <= kg_soft_budget:
-                    sections.append(f"- {src} ->")
-                else:
-                    break
-
-    hint_so_far = "\n".join(sections)
-
-    # Try to include neighbors block
-    if neighbors_block:
-        trial = hint_so_far + "\n" + neighbors_block
-        if count_tokens(tok, trial) <= kg_soft_budget:
-            hint_so_far = trial
-        else:
-            nb_trim = trim_to_token_budget(tok, neighbors_block, max(0, kg_soft_budget - count_tokens(tok, hint_so_far) - 4))
-            trial2 = hint_so_far + ("\n" + nb_trim if nb_trim else "")
-            if count_tokens(tok, trial2) <= kg_soft_budget:
-                hint_so_far = trial2
-
-    # Candidate ICD-9 list (context only)
-    cand_head = hint_so_far + ("\nCANDIDATE ICD9 (context only):\n")
-    kept_codes = []
+    # Candidate ICD-9 codes (context only)
+    body_head = head + ("\nCANDIDATE ICD9 (context only):\n")
+    kept=[]
     for c in allowed_codes:
-        trial = cand_head + " ".join(kept_codes + [c])
+        trial = body_head + " ".join(kept + [c])
         if count_tokens(tok, trial) <= kg_soft_budget:
-            kept_codes.append(c)
+            kept.append(c)
         else:
             break
 
-    if kept_codes:
-        return cand_head + " ".join(kept_codes)
+    if kept:
+        text = body_head + " ".join(kept)
+    else:
+        # fallback: trimmed head only
+        text = trim_to_token_budget(tok, head, kg_soft_budget)
+    return text
 
-    # If we couldn't fit any candidates, return what we have under budget
-    return trim_to_token_budget(tok, hint_so_far, kg_soft_budget)
+def _evidence_block_with_cuis(src2cuis: Dict[str, List[str]], tok, budget_left: int) -> str:
+    """Compact 'evidence with CUIs' lines: '- KEY: CUI1 CUI2 ...' within a small budget."""
+    if budget_left <= 0 or not src2cuis: return ""
+    lines = ["Evidence sources with CUIs:"]
+    for k, cuis in list(src2cuis.items())[:24]:
+        line = f"- {k}: " + " ".join(cuis[:20])
+        trial = "\n".join(lines + [line])
+        if count_tokens(tok, trial) <= budget_left:
+            lines.append(line)
+        else:
+            break
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 # ------------------------------- Prompt builders -------------------------------
 def build_tail(N_max_terms:int) -> str:
@@ -428,7 +457,7 @@ def build_generate_kwargs(decoding: str,
             do_sample=False,
             eos_token_id=eos_id,
             pad_token_id=pad_id,
-            no_repeat_ngram_size=no_repeat_ngram if no_repeat_ngram>0 else None,
+            no_repeat_ngram_size=(no_repeat_ngram if no_repeat_ngram>0 else None),
         )
     if decoding == "beam":
         return dict(
@@ -437,7 +466,7 @@ def build_generate_kwargs(decoding: str,
             do_sample=False,
             eos_token_id=eos_id,
             pad_token_id=pad_id,
-            no_repeat_ngram_size=no_repeat_ngram if no_repeat_ngram>0 else None,
+            no_repeat_ngram_size=(no_repeat_ngram if no_repeat_ngram>0 else None),
         )
     # sample
     return dict(
@@ -448,7 +477,7 @@ def build_generate_kwargs(decoding: str,
         top_k=top_k,
         eos_token_id=eos_id,
         pad_token_id=pad_id,
-        no_repeat_ngram_size=no_repeat_ngram if no_repeat_ngram>0 else None,
+        no_repeat_ngram_size=(no_repeat_ngram if no_repeat_ngram>0 else None),
     )
 
 @torch.no_grad()
@@ -456,7 +485,7 @@ def generate_texts(model, tok, prompts: List[str], max_len: int, gen_kwargs: dic
     device = device or (model.device if hasattr(model, "device") else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     outs = []
     bs = max(1, int(batch_size))
-    tok.padding_side = "left"  # ensure left padding for decoder-only
+    tok.padding_side = "left"  # ensure left pad for decoder-only
     for i in range(0, len(prompts), bs):
         batch = prompts[i:i+bs]
         enc = tok(batch, return_tensors="pt", padding=True, truncation=True,
@@ -467,6 +496,31 @@ def generate_texts(model, tok, prompts: List[str], max_len: int, gen_kwargs: dic
         dec = tok.batch_decode(gen, skip_special_tokens=False)
         outs.extend(dec)
     return outs
+
+# ------------------------------- N_max_terms dynamics -------------------------------
+def compute_terms_caps(gold_lists: List[List[str]]) -> Tuple[int, int, int]:
+    """Return (base_N, p50, p90) from gold distribution."""
+    sizes = sorted(len(x) for x in gold_lists)
+    if not sizes:
+        return 12, 10, 18  # safe defaults
+    def pct(p):
+        k = max(0, min(len(sizes)-1, int(round((p/100.0)* (len(sizes)-1)))))
+        return sizes[k]
+    p50 = pct(50)
+    p90 = pct(90)
+    base_N = int(max(6, min(24, round(p50 + 2))))  # median+2, clipped
+    return base_N, p50, p90
+
+def row_cap_from_candidates(base_N: int, p90: int, allowed_count: int) -> int:
+    """
+    If KG finds many plausible candidates, allow a bit more lines (up to p90).
+    If few, keep it tight. Prevents over/under-generation without cutting KG.
+    """
+    bonus = 0
+    if   allowed_count >= 30: bonus = 6
+    elif allowed_count >= 20: bonus = 4
+    elif allowed_count >= 10: bonus = 2
+    return int(max(6, min(p90, base_N + bonus)))
 
 # ------------------------------- Pretty printer -------------------------------
 def _pretty_print_block(title: str, d: dict):
@@ -491,14 +545,13 @@ def main():
     ap.add_argument("--print_samples", type=int, default=5)
 
     # prompts/generation
-    ap.add_argument("--N_max_terms", type=int, default=12)
+    ap.add_argument("--N_max_terms", type=int, default=0, help="If 0, compute dynamically from dataset; otherwise a hard cap.")
 
     # token budgets
     ap.add_argument("--total_input_budget", type=int, default=3072)
     ap.add_argument("--assistant_reserve",  type=int, default=128)
-    ap.add_argument("--notes_soft_budget",  type=int, default=2718)
-    ap.add_argument("--kg_soft_budget",     type=int, default=226)
-    ap.add_argument("--max_neighbors_show", type=int, default=24)
+    ap.add_argument("--notes_soft_budget",  type=int, default=2307)
+    ap.add_argument("--kg_soft_budget",     type=int, default=637)
 
     # decoding
     ap.add_argument("--gen_max_new", type=int, default=128)
@@ -542,6 +595,7 @@ def main():
     ap.add_argument("--hop", type=int, default=1, choices=[0,1,2])
     ap.add_argument("--rel_whitelist",  default="")
     ap.add_argument("--rela_whitelist", default="")
+    ap.add_argument("--max_neighbors_show", type=int, default=24)
 
     # distributed
     ap.add_argument("--distributed", action="store_true")
@@ -592,6 +646,12 @@ def main():
         log.info(f"Test size: {len(test_df)}")
         log.info(f"Eval label space: {len(labels_eval)} codes ({'FULL' if head_name is None else head_name})")
 
+    # ---------------- dataset prior & dynamic caps ----------------
+    code_prior = build_code_prior(gold_codes)
+    base_N, p50_codes, p90_codes = compute_terms_caps(gold_codes)
+    if is_main_process():
+        log.info(f"N_max_terms (dataset): base={base_N}, p50={p50_codes}, p90={p90_codes}")
+
     # ---------------- model (adapter-only, LEFT padding) ----------------
     dtype = torch.bfloat16 if (args.use_bf16 and torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8) \
            else (torch.float16 if torch.cuda.is_available() else torch.float32)
@@ -622,8 +682,9 @@ def main():
     max_prompt = max(1, args.total_input_budget - args.assistant_reserve)
 
     for i, row in test_df.iterrows():
-        # evidence → CUIs (per-source) and union set
+        # evidence (with CUIs)
         src2cuis, ev_cuis = visit_evidence_cuis(row, icd9_proc_map, loinc_map, atc_map)
+
         # neighbors & expansion
         expanded_cuis, neighbors_block = render_neighbors_block(
             KG, ev_cuis, hop=args.hop,
@@ -631,15 +692,50 @@ def main():
             max_neighbors_show=args.max_neighbors_show
         )
         bag_cuis = expanded_cuis
-        allowed  = allowed_icd9_from_cuis(icd9_dx_map, bag_cuis)
 
-        kg_text  = build_kg_hints_text(
-            allowed, src2cuis, tok,
-            kg_soft_budget=args.kg_soft_budget,
-            neighbors_block=neighbors_block
+        # allowed from KG; if none, fallback to prior top-K (keep small)
+        allowed  = allowed_icd9_from_cuis(icd9_dx_map, bag_cuis)
+        if not allowed:
+            allowed = top_prior_codes(code_prior, k=50)
+
+        # row-adaptive cap
+        dynamic_base = base_N if args.N_max_terms == 0 else args.N_max_terms
+        N_this = row_cap_from_candidates(dynamic_base, p90_codes, allowed_count=len(allowed))
+
+        # rank candidates even if no explicit paths
+        notes_text = serialize_notes(row)
+        cues = extract_note_cues(notes_text)
+        nb_only = bag_cuis - ev_cuis
+        allowed_ranked = rank_candidates(
+            allowed_codes=allowed,
+            icd9_dx_map=icd9_dx_map,
+            ev_cuis=ev_cuis,
+            nb_cuis=nb_only,
+            note_cues=cues,
+            code_prior=code_prior
         )
 
-        raw_p, kg_p, d = build_prompts_for_row(row, tok, kg_text, args.notes_soft_budget, args.N_max_terms)
+        # evidence-with-CUIs block (compact)
+        ev_block = _evidence_block_with_cuis(src2cuis, tok, args.kg_soft_budget//2)
+
+        # evid raw keys (for short headers)
+        evid_raw = {
+            "ATC":  list({k.split(':',1)[1] for k in src2cuis if k.startswith("ATC:")}),
+            "PROC": list({k.split(':',1)[1] for k in src2cuis if k.startswith("PROC:")}),
+            "LOINC":list({k.split(':',1)[1] for k in src2cuis if k.startswith("LNC:")}),
+        }
+
+        kg_text  = build_kg_hints_text(
+            allowed_codes=allowed_ranked,
+            evid_raw=evid_raw,
+            tok=tok,
+            kg_soft_budget=args.kg_soft_budget,
+            neighbors_block=neighbors_block,
+            evidence_cuis_block=ev_block
+        )
+
+        # prompts
+        raw_p, kg_p, d = build_prompts_for_row(row, tok, kg_text, args.notes_soft_budget, N_this)
 
         # final clamp
         if d["total_raw"] > max_prompt:
@@ -647,14 +743,15 @@ def main():
             new_notes = max(0, d["notes_tokens"] - over - 8)
             notes_trim = trim_to_token_budget(tok, serialize_notes(row), new_notes)
             header = f"[VISIT] subject_id={row.get('subject_id_x','?')} hadm_id={row.get('hadm_id','?')}\n" + serialize_structured_readable(row)
-            tail   = build_tail(args.N_max_terms)
+            tail   = build_tail(N_this)
             raw_p = "\n".join([x for x in [header, notes_trim, tail] if x])
             d["total_raw"] = count_tokens(tok, raw_p)
+
         if d["total_kg"] > max_prompt:
             # try shrinking KG block first
             shrink = max(0, args.kg_soft_budget - (d["total_kg"] - max_prompt))
             kg_text2 = trim_to_token_budget(tok, kg_text, shrink)
-            raw_p2, kg_p2, d2 = build_prompts_for_row(row, tok, kg_text2, args.notes_soft_budget, args.N_max_terms)
+            raw_p2, kg_p2, d2 = build_prompts_for_row(row, tok, kg_text2, args.notes_soft_budget, N_this)
             if count_tokens(tok, kg_p2) <= max_prompt:
                 kg_p, d = kg_p2, d2
             else:
@@ -670,6 +767,7 @@ def main():
             "ev_cuis": len(ev_cuis),
             "exp_cuis": len(bag_cuis),
             "allowed_icd9": len(allowed),
+            "N_cap": N_this,
             **d
         })
 
@@ -702,8 +800,8 @@ def main():
     raw_out_texts = generate_texts(model, tok, shard_raw, max_len=args.total_input_budget, gen_kwargs=gen_kwargs, batch_size=args.gen_batch_size, device=dev)
     kg_out_texts  = generate_texts(model, tok, shard_kg,  max_len=args.total_input_budget, gen_kwargs=gen_kwargs, batch_size=args.gen_batch_size, device=dev)
 
-    raw_terms = _safe_extract_batch(raw_out_texts, args.N_max_terms, "RAW")
-    kg_terms  = _safe_extract_batch(kg_out_texts,  args.N_max_terms, "KG")
+    raw_terms = _safe_extract_batch(raw_out_texts,  max(d["N_cap"] for d in dbg_rows), "RAW")
+    kg_terms  = _safe_extract_batch(kg_out_texts,   max(d["N_cap"] for d in dbg_rows), "KG")
 
     if is_main_process():
         per = (time.time()-t0)/max(1,len(idxs))
@@ -901,11 +999,11 @@ def main():
             log.info(f"[Sample {i+1}] hadm={test_df.iloc[i].get('hadm_id','')}")
             log.info(f"  GOLD codes: {', '.join(sorted(G)) if G else '(none)'}")
             log.info(  "  RAW free-text terms:")
-            for t in raw_terms_all[i][:args.N_max_terms]:
+            for t in raw_terms_all[i][:dbg_rows[i]['N_cap']]:
                 log.info(f"    - {t}")
             log.info(f"  RAW mapped ICD-9: {', '.join(sorted(R)) if R else '(none)'}  | P/R/F1 = {pr:.3f}/{rr:.3f}/{fr:.3f}")
             log.info(  "  KG  free-text terms:")
-            for t in kg_terms_all[i][:args.N_max_terms]:
+            for t in kg_terms_all[i][:dbg_rows[i]['N_cap']]:
                 log.info(f"    - {t}")
             log.info(f"  KG  mapped ICD-9: {', '.join(sorted(K)) if K else '(none)'}  | P/R/F1 = {pr2:.3f}/{rr2:.3f}/{fr2:.3f}")
 
