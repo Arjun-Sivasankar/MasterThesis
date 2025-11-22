@@ -1,6 +1,7 @@
 logs/
 dataset/
 secrets.yaml
+.ipynb_checkpoints/secrets-checkpoint.yaml
 
 ## Analysis files
 icd10_analysis/
