@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-build_medical_fact_index.py
+build_medical_fact_index.py (DATASET AWARE)
 
 OFFLINE PREPROCESSING: Build a searchable index of medical facts from UMLS KG.
 
