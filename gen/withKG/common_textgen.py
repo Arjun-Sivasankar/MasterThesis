@@ -80,6 +80,18 @@ def norm_text(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def _strip(x) -> str:
+    return str(x or "").strip().upper().replace(" ", "")
+
+def format_icd9_proc_from_pro(c: str) -> str:
+    s = _strip(c)
+    if s.startswith("PRO_"): s = s[4:]
+    s = re.sub(r"[^0-9]", "", s)
+    if not s: return ""
+    if len(s) >= 3:
+        return s[:2] + "." + s[2:]
+    return s
+
 def format_icd9(code: str) -> str:
     code = re.sub(r"\s+","", str(code)).upper().rstrip(".")
     if not code: return ""
@@ -122,6 +134,7 @@ def get_icd9_parent(code: str) -> str:
 def serialize_structured_readable(row: pd.Series) -> str:
     ndc  = " ".join(to_list(row.get("ndc", []))[:24])
     proc = " ".join(to_list(row.get("pro_code", []))[:24])
+    proc = [format_icd9_proc_from_pro(c) for c in proc if c]
     labs = " ".join(to_list(row.get("lab_test", []))[:48])
     parts=[]
     parts.append(f"DEMOGRAPHICS: gender={row.get('gender','')} age_group={row.get('age','')}")

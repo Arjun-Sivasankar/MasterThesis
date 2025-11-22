@@ -39,23 +39,72 @@ echo "[INFO] Virtual env loaded: $VIRTUAL_ENV"
 #     --edge-label none \
 #     --out subgraphs/subgraph_C0152602_r1_dirin.png
 
+# ----------------------- kg output2 ----------------------- #
+# python viz_subgraph.py \
+#     --seed C0152602 \
+#     --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_nodes.csv \
+#     --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_edges.csv \
+#     --radius 1 \
+#     --direction both \
+#     --edge-label none \
+#     --out subgraphs/new/subgraph_C0152602_r1_dirboth.png
+
+# python viz_subgraph.py \
+#     --seed C0152602 \
+#     --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_nodes.csv \
+#     --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_edges.csv \
+#     --radius 2 \
+#     --direction both \
+#     --edge-label none \
+#     --out subgraphs/new/subgraph_C0152602_r2_dirboth.png
+
+# ----------------------- kg output3 ----------------------- #
 python viz_subgraph.py \
-    --seed C0152602 \
-    --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_nodes.csv \
-    --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_edges.csv \
+    --seed C1704311 \
+    --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_nodes.csv \
+    --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_edges.csv \
     --radius 1 \
     --direction both \
     --edge-label none \
-    --out subgraphs/new/subgraph_C0152602_r1_dirboth.png
+    --out subgraphs/with_kgoutput4/subgraph_C1704311_r1_dirboth.png
 
 python viz_subgraph.py \
-    --seed C0152602 \
-    --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_nodes.csv \
-    --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output2/kg_edges.csv \
+    --seed C1704311 \
+    --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_nodes.csv \
+    --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_edges.csv \
     --radius 2 \
     --direction both \
     --edge-label none \
-    --out subgraphs/new/subgraph_C0152602_r2_dirboth.png
+    --out subgraphs/with_kgoutput4/subgraph_C1704311_r2_dirboth.png
+
+python viz_subgraph.py \
+    --seed C1704311 \
+    --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_nodes.csv \
+    --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_edges.csv \
+    --radius 3 \
+    --direction both \
+    --edge-label none \
+    --out subgraphs/with_kgoutput4/subgraph_C1704311_r3_dirboth.png
+
+python viz_subgraph.py \
+    --seed C1704311 \
+    --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_nodes.csv \
+    --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output4/kg_edges.csv \
+    --radius 4 \
+    --direction both \
+    --edge-label none \
+    --out subgraphs/with_kgoutput4/subgraph_C1704311_r4_dirboth.png
+
+## DOESN't WORK DUE TO MEMORY LIMITS ##
+# python viz_subgraph.py \
+#     --seed C1704311 \
+#     --nodes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output3/kg_nodes.csv \
+#     --edges /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output3/kg_edges.csv \
+#     --radius 5 \
+#     --direction both \
+#     --edge-label none \
+#     --out subgraphs/with_kgoutput3/subgraph_C1704311_r5_dirboth.png
+
 
 # 1-hop, hide edge labels if the figure is cluttered:
 # python viz_subgraph.py \

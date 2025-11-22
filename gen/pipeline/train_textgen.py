@@ -336,7 +336,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-train_codegen.py — HF Trainer with rich logging (train/eval loss summaries),
+train_textgen.py — HF Trainer with rich logging (train/eval loss summaries),
 solid DDP teardown, and safe adapter saving.
 """
 

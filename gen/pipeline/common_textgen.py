@@ -122,7 +122,7 @@ def get_icd9_parent(code: str) -> str:
 def serialize_structured_readable(row: pd.Series) -> str:
     ndc  = " ".join(to_list(row.get("ndc", []))[:24])
     proc = " ".join(to_list(row.get("pro_code", []))[:24])
-    labs = " ".join(to_list(row.get("lab_test", []))[:48])
+    labs = " ".join(to_list(row.get("lab_test_loinc", []))[:48])
     parts=[]
     parts.append(f"DEMOGRAPHICS: gender={row.get('gender','')} age_group={row.get('age','')}")
     if ndc:  parts.append(f"MEDICATIONS: {ndc}")

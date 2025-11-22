@@ -119,6 +119,7 @@ PROJECT_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis
 cd "$PROJECT_DIR" || { echo "Project dir not found: $PROJECT_DIR"; exit 1; }
 
 SCRIPT=gen/withKG/codegen_withKG_prompt.py
+echo "[INFO] Running script: $SCRIPT"
 mkdir -p logs/codegenKGprompt
 
 TEST_PKL=$PROJECT_DIR/dataset/icd9/test_df.pkl

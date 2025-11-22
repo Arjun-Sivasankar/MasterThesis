@@ -13,6 +13,9 @@ runs_hpo/
 runs_base_eval_fast/
 runs_textgen
 runs_codegen
+runs_codegen_infer/
+runs_textgen_nextdiag/
+runs_textgen_rag/
 
 ## wandb logs
 wandb/
@@ -36,6 +39,7 @@ KG/coverage_analysis/
 KG/kg_output/
 KG/kg_output2/
 KG/kg_output3/
+KG/kg_output4/
 KG/lab_test_analysis/
 KG/mapping_analysis/
 KG/med_analysis/
@@ -56,3 +60,18 @@ gen/withKG/outputs/
 *.bin
 *.ckpt
 *.safetensors
+
+# Fact Indexes
+fact_index_dataset_aware/
+fact_indexes/
+
+# RAG stuffs
+gen/withKG/RAG/biobert-mnli-snli-scinli-scitail-mednli-stsb
+gen/withKG/RAG/kg_recommender
+gen/withKG/RAG/analysis
+gen/withKG/RAG/analysis2
+gen/withKG/RAG/analysis3
+
+# preprocesessed data
+preprocessed_data/
+preprocessed_data2/

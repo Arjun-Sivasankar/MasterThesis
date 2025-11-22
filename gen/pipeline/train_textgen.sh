@@ -40,6 +40,7 @@ SCRIPT=gen/pipeline/train_textgen.py
 
 ### 5) Paths & args (edit as needed)
 DATA_PKL=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/merged_icd9.pkl
+# DATA_PKL=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/final_data/train_df.pkl
 ICD_INDEX=./gen/TextGen/icd_index_v9
 OUT_DIR=runs_textgen/checkpoints
 ADAPTER_DIR=runs_textgen/adapter_v1
