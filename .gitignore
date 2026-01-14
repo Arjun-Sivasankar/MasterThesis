@@ -1,5 +1,4 @@
 logs/
-dataset/
 secrets.yaml
 .ipynb_checkpoints/secrets-checkpoint.yaml
 
@@ -76,3 +75,5 @@ gen/withKG/RAG/analysis3
 # preprocesessed data
 preprocessed_data/
 preprocessed_data2/
+
+dataset/mimic_with_lab_mappings.pkl
