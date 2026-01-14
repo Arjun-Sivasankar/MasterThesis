@@ -20,14 +20,13 @@ cd /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG || { echo "Project di
 source /data/horse/ws/arsi805e-venv/venvs/finetune/bin/activate
 echo "[INFO] Virtual env loaded: $VIRTUAL_ENV"
 
-# python KG/buildKG.py
 python code2cui.py \
-  --mrconso /data/horse/ws/arsi805e-finetune/Thesis/UMLS/2025AA/META/MRCONSO.RRF \
-  --out-dir /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/output \
+  --mrconso ./UMLS/2025AA/META/MRCONSO.RRF \
+  --out-dir ./KG/output \
   --langs ENG \
   --chunk-size 1000000 \
   --with_names \
-  --dataset-codes /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/merged_icd9.pkl \
+  --dataset-codes ./dataset/merged_icd9.pkl \
   --allow-suppress-for-dataset
 
 

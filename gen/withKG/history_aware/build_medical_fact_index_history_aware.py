@@ -1,8 +1,23 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-build_medical_fact_index.py
+build_medical_fact_index_history_aware.py
+
+Build separate searchable medical fact indexes for HISTORY-AWARE diagnosis prediction.
+
+KEY DIFFERENCE FROM BASELINE:
+- PAST diagnosis codes are SOURCE CUIs (evidence from history)
+- CURRENT diagnosis codes remain TARGET CUIs (prediction targets)
+- Medications, labs, procedures, AND past diagnoses contribute to source CUIs
+- Current diagnoses from code2cui_icd9_dx.pkl are targets
+- Path deduplication and dual limits (per-source AND per-target)
+
+PRINCIPLE: 
+- Past diagnosis history provides evidence for current diagnosis prediction
+- Only CURRENT diagnoses are prediction targets
+- PAST diagnoses act as evidence sources (like medications, labs, procedures)
 """
+
 import sys
 import json
 import pickle
@@ -103,20 +118,28 @@ def convert_sets_to_lists(obj):
     return obj
 
 # =============================================================================
-# DATASET CODE EXTRACTION - NO ICD CODES AS SOURCES
+# DATASET CODE EXTRACTION - WITH PAST DIAGNOSIS AS SOURCES
 # =============================================================================
 
 def extract_source_codes_from_dataframe(df: pd.DataFrame, split_name: str) -> Dict[str, Set[str]]:
     """
-    Extract SOURCE codes from dataframe - EXCLUDES ICD diagnosis codes.
+    Extract SOURCE codes from history-aware dataframe.
     
-    ICD codes are targets to predict, not evidence sources.
-    Only medications, labs, procedures are valid sources.
+    KEY DIFFERENCE: PAST diagnosis codes are included as sources (evidence).
+    CURRENT diagnosis codes are targets (predicted), NOT sources.
+    
+    Returns:
+        Dictionary with sets of codes for:
+        - medications (NDC)
+        - labs (LOINC)
+        - procedures (ICD9-PROC)
+        - past_diagnoses (ICD9-DX from history) ✓ NEW
     """
     codes_by_type = {
         'medications': set(),
         'labs': set(), 
-        'procedures': set()
+        'procedures': set(),
+        'past_diagnoses': set()  # ✓ NEW: Past diagnoses as sources
     }
     
     # Medications (NDC codes)
@@ -141,6 +164,14 @@ def extract_source_codes_from_dataframe(df: pd.DataFrame, split_name: str) -> Di
                 if formatted:
                     codes_by_type['procedures'].add(formatted)
     
+    # ✓ NEW: Past diagnoses (ICD9-DX from history)
+    if 'icd_code' in df.columns:
+        for row_val in df['icd_code']:
+            for code in to_list(row_val):
+                formatted = format_icd9(code)
+                if formatted:
+                    codes_by_type['past_diagnoses'].add(formatted)
+    
     # Clean empty entries
     for key in codes_by_type:
         codes_by_type[key].discard('')
@@ -152,16 +183,22 @@ def map_source_codes_to_cuis(
     atc_map: Dict[str, List[str]],
     loinc_map: Dict[str, List[str]], 
     proc_map: Dict[str, List[str]],
+    dx_map: Dict[str, List[str]],  # ✓ Used for PAST diagnoses
     split_name: str
 ) -> Tuple[Set[str], Dict[str, Dict]]:
-    """Map SOURCE codes to CUIs - no diagnosis codes included."""
-    log.info(f"\n  Mapping {split_name} SOURCE codes to CUIs (excluding diagnosis codes)...")
+    """
+    Map SOURCE codes to CUIs - NOW includes past diagnosis codes.
+    
+    ✓ NEW: Past diagnosis codes are mapped using dx_map and treated as sources.
+    """
+    log.info(f"\n  Mapping {split_name} SOURCE codes to CUIs (INCLUDING past diagnoses)...")
     
     source_cuis = set()
     mapping_stats = {
         'medications': {'codes': 0, 'mapped': 0, 'cuis': set()},
         'labs': {'codes': 0, 'mapped': 0, 'cuis': set()},
         'procedures': {'codes': 0, 'mapped': 0, 'cuis': set()},
+        'past_diagnoses': {'codes': 0, 'mapped': 0, 'cuis': set()},  # ✓ NEW
         'unmapped': {'codes': 0}
     }
     
@@ -213,20 +250,31 @@ def map_source_codes_to_cuis(
              f"({100*mapping_stats['procedures']['mapped']/max(1, mapping_stats['procedures']['codes']):.1f}%) "
              f"→ {len(mapping_stats['procedures']['cuis'])} CUIs")
     
+    # ✓ NEW: Past diagnoses (ICD9-DX from history)
+    log.info(f"    Mapping past diagnoses (ICD9-DX from history)...")
+    for code in codes_by_type['past_diagnoses']:
+        mapping_stats['past_diagnoses']['codes'] += 1
+        if code in dx_map:
+            cui_list = dx_map[code]
+            source_cuis.update(cui_list)
+            mapping_stats['past_diagnoses']['cuis'].update(cui_list)
+            mapping_stats['past_diagnoses']['mapped'] += 1
+        else:
+            mapping_stats['unmapped']['codes'] += 1
+    
+    log.info(f"      → {mapping_stats['past_diagnoses']['mapped']}/{mapping_stats['past_diagnoses']['codes']} mapped "
+             f"({100*mapping_stats['past_diagnoses']['mapped']/max(1, mapping_stats['past_diagnoses']['codes']):.1f}%) "
+             f"→ {len(mapping_stats['past_diagnoses']['cuis'])} CUIs")
+    
     return source_cuis, mapping_stats
 
 def extract_diagnosis_target_cuis(dx_map: Dict[str, List[str]]) -> Tuple[Set[str], Dict]:
     """
-    Extract ALL diagnosis CUIs as potential targets from the pkl mapping file.
+    Extract ALL diagnosis CUIs as CURRENT prediction targets from pkl mapping.
     
-    Args:
-        dx_map: code2cui_icd9_dx.pkl mapping
-        
-    Returns:
-        diagnosis_cuis: Set of all diagnosis CUIs
-        diagnosis_stats: Statistics about diagnosis CUIs
+    These are CURRENT diagnoses to predict, NOT past diagnoses (which are sources).
     """
-    log.info(f"\nExtracting diagnosis target CUIs from pkl mapping file...")
+    log.info(f"\nExtracting CURRENT diagnosis target CUIs from pkl mapping file...")
     
     diagnosis_cuis = set()
     for icd_code, cui_list in dx_map.items():
@@ -239,7 +287,7 @@ def extract_diagnosis_target_cuis(dx_map: Dict[str, List[str]]) -> Tuple[Set[str
         'avg_cuis_per_code': len(diagnosis_cuis) / len(dx_map) if dx_map else 0
     }
     
-    log.info(f"✓ Extracted {len(diagnosis_cuis)} unique diagnosis CUIs from {len(dx_map)} ICD9-DX codes")
+    log.info(f"✓ Extracted {len(diagnosis_cuis)} unique CURRENT diagnosis CUIs from {len(dx_map)} ICD9-DX codes")
     log.info(f"  Average CUIs per ICD code: {diagnosis_stats['avg_cuis_per_code']:.2f}")
     
     return diagnosis_cuis, diagnosis_stats
@@ -254,30 +302,32 @@ def extract_dataset_source_cuis(
     dx_map: Dict
 ) -> Tuple[Set[str], Dict, Set[str], Dict]:
     """
-    Extract SOURCE CUIs from dataset (no diagnosis codes) and ALL diagnosis target CUIs from pkl.
+    Extract SOURCE CUIs (with PAST diagnoses) + CURRENT diagnosis target CUIs.
     
     Returns:
-        - source_cuis: CUIs from medications, labs, procedures in dataset
+        - source_cuis: CUIs from medications, labs, procedures, AND past diagnoses
         - stats: mapping statistics  
-        - diagnosis_target_cuis: ALL possible diagnosis CUIs (from dx_map pkl)
-        - diagnosis_stats: Statistics about diagnosis CUIs from pkl
+        - diagnosis_target_cuis: CURRENT diagnosis CUIs (from dx_map pkl)
+        - diagnosis_stats: Statistics about diagnosis CUIs
     """
     log.info("="*80)
-    log.info("EXTRACTING SOURCE CUIs (NO DIAGNOSIS) + TARGET DIAGNOSIS CUIs")
+    log.info("EXTRACTING SOURCE CUIs (WITH PAST DIAGNOSES) + CURRENT TARGET CUIs")
     log.info("="*80)
     
     all_source_cuis = set()
     overall_stats = {}
     
-    # Extract source CUIs from each dataset split (no diagnosis codes)
+    # Extract source CUIs from each dataset split (including past diagnoses)
     for split_name, pkl_path in [("train", train_pkl), ("val", val_pkl), ("test", test_pkl)]:
         if pkl_path and Path(pkl_path).exists():
-            log.info(f"\nProcessing {split_name} split: {pkl_path}")
+            log.info(f"\n📊 Processing {split_name} split: {pkl_path}")
             df = pd.read_pickle(pkl_path)
             log.info(f"  Loaded {len(df)} visits")
             
             codes = extract_source_codes_from_dataframe(df, split_name)
-            source_cuis, mapping_stats = map_source_codes_to_cuis(codes, atc_map, loinc_map, proc_map, split_name)
+            source_cuis, mapping_stats = map_source_codes_to_cuis(
+                codes, atc_map, loinc_map, proc_map, dx_map, split_name
+            )
             
             all_source_cuis.update(source_cuis)
             overall_stats[split_name] = {
@@ -289,7 +339,7 @@ def extract_dataset_source_cuis(
             
             log.info(f"  → {len(source_cuis)} unique source CUIs from {split_name}")
     
-    # Extract ALL diagnosis target CUIs from pkl mapping (NOT from dataset)
+    # Extract CURRENT diagnosis target CUIs (prediction targets)
     diagnosis_target_cuis, diagnosis_stats = extract_diagnosis_target_cuis(dx_map)
     
     # Summary
@@ -297,21 +347,21 @@ def extract_dataset_source_cuis(
     log.info("OVERALL CUI EXTRACTION SUMMARY")
     log.info(f"{'='*80}")
     log.info(f"SOURCE CUIs (from dataset): {len(all_source_cuis)}")
-    log.info(f"  - From medications, labs, procedures only")
-    log.info(f"  - ICD diagnosis codes EXCLUDED (they are targets)")
+    log.info(f"  - From medications, labs, procedures, AND past diagnoses")
+    log.info(f"  - Past diagnoses provide historical evidence")
     log.info(f"")
-    log.info(f"DIAGNOSIS TARGET CUIs (from pkl mapping): {len(diagnosis_target_cuis)}")
+    log.info(f"CURRENT DIAGNOSIS TARGET CUIs (from pkl mapping): {len(diagnosis_target_cuis)}")
     log.info(f"  - From code2cui_icd9_dx.pkl")
     log.info(f"  - Total ICD codes: {diagnosis_stats['total_icd_codes_in_mapping']}")
     log.info(f"  - Unique diagnosis CUIs: {diagnosis_stats['unique_diagnosis_cuis']}")
     log.info(f"")
-    log.info(f"OVERLAP: {len(all_source_cuis & diagnosis_target_cuis)} CUIs appear as both source and diagnosis target")
+    log.info(f"OVERLAP: {len(all_source_cuis & diagnosis_target_cuis)} CUIs appear as both past diagnosis (source) and current diagnosis (target)")
     log.info(f"{'='*80}")
     
     return all_source_cuis, overall_stats, diagnosis_target_cuis, diagnosis_stats
 
 # =============================================================================
-# PATH MINING WITH DEDUPLICATION AND DUAL LIMITS
+# PATH MINING (UNCHANGED - same as baseline)
 # =============================================================================
 
 def mine_h1_paths_source_to_diagnosis(
@@ -322,14 +372,7 @@ def mine_h1_paths_source_to_diagnosis(
     max_diagnosis_paths_per_source: int = None,
     max_diagnosis_paths_per_target: int = None
 ) -> Tuple[List[dict], Dict[str, int]]:
-    """
-    Mine H1 paths with deduplication and dual limits.
-    
-    Limits:
-    - max_paths_per_source: General paths per source CUI
-    - max_diagnosis_paths_per_source: Diagnosis paths per source CUI
-    - max_diagnosis_paths_per_target: Diagnosis paths per target CUI
-    """
+    """Mine H1 paths with deduplication and dual limits."""
     log.info(f"Mining H1 paths (source→any/diagnosis targets) with deduplication...")
     log.info(f"  Max general paths per source: {max_paths_per_source}")
     log.info(f"  Max diagnosis paths per source: {max_diagnosis_paths_per_source}")
@@ -361,7 +404,6 @@ def mine_h1_paths_source_to_diagnosis(
             
             is_diagnosis_target = v in diagnosis_target_cuis
             
-            # Apply limits
             if is_diagnosis_target:
                 if max_diagnosis_paths_per_source and diagnosis_paths_added[u] >= max_diagnosis_paths_per_source:
                     skipped_by_source_limit += 1
@@ -381,8 +423,8 @@ def mine_h1_paths_source_to_diagnosis(
             path = {
                 'src': u,
                 'nbr': v,
-                'src_name': G.nodes[u].get('name', u),  # ✓ FIXED: Get from node attributes
-                'nbr_name': G.nodes[v].get('name', v),  # ✓ FIXED: Get from node attributes
+                'src_name': G.nodes[u].get('name', u),
+                'nbr_name': G.nodes[v].get('name', v),
                 'rela_canon': rela_canon,
                 'rela': data.get('rela', ''),
                 'rel': data.get('rel', ''),
@@ -430,14 +472,7 @@ def mine_h2_paths_source_to_diagnosis(
     max_diagnosis_paths_per_source: int = None,
     max_diagnosis_paths_per_target: int = None
 ) -> Tuple[List[dict], Dict[str, int]]:
-    """
-    Mine H2 paths with deduplication and dual limits.
-    
-    Limits:
-    - max_paths_per_source: General paths per source CUI
-    - max_diagnosis_paths_per_source: Diagnosis paths per source CUI
-    - max_diagnosis_paths_per_target: Diagnosis paths per target CUI
-    """
+    """Mine H2 paths with deduplication and dual limits."""
     log.info(f"Mining H2 paths (source→intermediate→any/diagnosis targets) with deduplication...")
     log.info(f"  Max general paths per source: {max_paths_per_source}")
     log.info(f"  Max diagnosis paths per source: {max_diagnosis_paths_per_source}")
@@ -472,7 +507,6 @@ def mine_h2_paths_source_to_diagnosis(
                 
                 is_diagnosis_target = w in diagnosis_target_cuis
                 
-                # Apply limits
                 if is_diagnosis_target:
                     if max_diagnosis_paths_per_source and diagnosis_paths_added[u] >= max_diagnosis_paths_per_source:
                         skipped_by_source_limit += 1
@@ -498,9 +532,9 @@ def mine_h2_paths_source_to_diagnosis(
                 
                 path = {
                     'u': u, 'v': v, 'w': w,
-                    'u_name': G.nodes[u].get('name', u),  
-                    'v_name': G.nodes[v].get('name', v),  
-                    'w_name': G.nodes[w].get('name', w),  
+                    'u_name': G.nodes[u].get('name', u),
+                    'v_name': G.nodes[v].get('name', v),
+                    'w_name': G.nodes[w].get('name', w),
                     'rela_uv_canon': rela_uv_canon,
                     'rela_vw_canon': rela_vw_canon,
                     'rela_uv': uv_data.get('rela', ''),
@@ -542,7 +576,7 @@ def mine_h2_paths_source_to_diagnosis(
     return H2, stats
 
 # =============================================================================
-# SAPBERT ENCODER
+# SAPBERT ENCODER (UNCHANGED)
 # =============================================================================
 
 class SapBERTEncoder:
@@ -606,7 +640,7 @@ class SapBERTEncoder:
         return result
 
 # =============================================================================
-# PATH LINEARIZATION
+# PATH LINEARIZATION (UNCHANGED)
 # =============================================================================
 
 def clean_name(name: str) -> str:
@@ -618,12 +652,7 @@ def clean_name(name: str) -> str:
     return name if name else "unknown"
 
 def linearize_h1_path_with_metadata(path: dict) -> Tuple[str, str, bool]:
-    """
-    Convert H1 path to natural language + extract relationship metadata.
-    
-    Returns:
-        Tuple[str, str, bool]: (fact_text, relationship_type, is_diagnosis_target)
-    """
+    """Convert H1 path to natural language + extract relationship metadata."""
     src = clean_name(path.get("src_name", ""))
     tgt = clean_name(path.get("nbr_name", ""))
     rel = path.get("rela_canon") or path.get("rela") or path.get("rel") or "related_to"
@@ -639,12 +668,7 @@ def linearize_h1_path_with_metadata(path: dict) -> Tuple[str, str, bool]:
     return fact_text, relationship_type, is_diagnosis_target
 
 def linearize_h2_path_with_metadata(path: dict) -> Tuple[str, List[str], bool]:
-    """
-    Convert H2 path to natural language + extract BOTH relationships.
-    
-    Returns:
-        Tuple[str, List[str], bool]: (fact_text, [rel1, rel2], is_diagnosis_target)
-    """
+    """Convert H2 path to natural language + extract BOTH relationships."""
     u = clean_name(path.get("u_name", ""))
     v = clean_name(path.get("v_name", ""))
     w = clean_name(path.get("w_name", ""))
@@ -656,11 +680,10 @@ def linearize_h2_path_with_metadata(path: dict) -> Tuple[str, List[str], bool]:
     rel_vw_text = rel_vw.strip().replace("_", " ")
     
     if not u or not v or not w:
-        return "", ["other", "other"], False  # ✓ Return list for H2
+        return "", ["other", "other"], False
     
     fact_text = f"{u} {rel_uv_text} {v} which {rel_vw_text} {w}"
     
-    # ✓ FIXED: Return BOTH relationships as a list
     relationship_types = [
         path.get("rela_uv_canon", "other"),
         path.get("rela_vw_canon", "other")
@@ -671,7 +694,7 @@ def linearize_h2_path_with_metadata(path: dict) -> Tuple[str, List[str], bool]:
     return fact_text, relationship_types, is_diagnosis_target
 
 # =============================================================================
-# FAISS INDEX CREATION
+# FAISS INDEX CREATION (UNCHANGED)
 # =============================================================================
 
 def create_faiss_index(embeddings: np.ndarray, use_gpu: bool = False) -> faiss.Index:
@@ -695,12 +718,12 @@ def create_faiss_index(embeddings: np.ndarray, use_gpu: bool = False) -> faiss.I
     return index
 
 # =============================================================================
-# SEPARATE INDEX SAVING
+# SEPARATE INDEX SAVING (UNCHANGED)
 # =============================================================================
 
 def save_separate_indexes(
     h1_facts: List[str], h1_embeddings: np.ndarray, h1_relationships: List[str], h1_diagnosis_flags: List[bool],
-    h2_facts: List[str], h2_embeddings: np.ndarray, h2_relationships: List[List[str]], h2_diagnosis_flags: List[bool],  # ✓ Updated type hint
+    h2_facts: List[str], h2_embeddings: np.ndarray, h2_relationships: List[List[str]], h2_diagnosis_flags: List[bool],
     output_dir: Path,
     metadata: dict = None
 ):
@@ -711,7 +734,7 @@ def save_separate_indexes(
     log.info(f"SAVING SEPARATE INDEXES TO: {output_dir}")
     log.info(f"{'='*80}")
     
-    # H1 Index (UNCHANGED)
+    # H1 Index
     h1_dir = output_dir / "h1_index"
     h1_dir.mkdir(exist_ok=True)
     log.info(f"\n[H1 INDEX]")
@@ -723,10 +746,9 @@ def save_separate_indexes(
     log.info(f"  ✓ Saved {len(h1_facts)} facts")
     
     with open(h1_dir / "relationships.json", 'w', encoding='utf-8') as f:
-        json.dump(h1_relationships, f, indent=2)  # ✓ List of strings
+        json.dump(h1_relationships, f, indent=2)
     log.info(f"  ✓ Saved {len(h1_relationships)} relationships (single)")
     
-    # Show H1 relationship distribution
     h1_rel_counter = Counter(h1_relationships)
     log.info(f"  Relationship distribution (top 10):")
     for rel, count in h1_rel_counter.most_common(10):
@@ -740,7 +762,7 @@ def save_separate_indexes(
     faiss.write_index(h1_index, str(h1_dir / "faiss_index.bin"))
     log.info(f"  ✓ Saved embeddings and FAISS index")
     
-    # H2 Index (WITH DUAL RELATIONSHIPS)
+    # H2 Index
     h2_dir = output_dir / "h2_index"
     h2_dir.mkdir(exist_ok=True)
     log.info(f"\n[H2 INDEX]")
@@ -751,12 +773,10 @@ def save_separate_indexes(
         json.dump(h2_facts, f, indent=2)
     log.info(f"  ✓ Saved {len(h2_facts)} facts")
     
-    # ✓ IMPORTANT: Save dual relationships for H2
     with open(h2_dir / "relationships.json", 'w', encoding='utf-8') as f:
-        json.dump(h2_relationships, f, indent=2)  # ✓ List of lists
+        json.dump(h2_relationships, f, indent=2)
     log.info(f"  ✓ Saved {len(h2_relationships)} dual relationships")
     
-    # ✓ Show BOTH relationship distributions for H2
     h2_first_rels = [rels[0] for rels in h2_relationships]
     h2_second_rels = [rels[1] for rels in h2_relationships]
     
@@ -779,12 +799,12 @@ def save_separate_indexes(
     faiss.write_index(h2_index, str(h2_dir / "faiss_index.bin"))
     log.info(f"  ✓ Saved embeddings and FAISS index")
     
-    # Combined metadata with proper structure
+    # Combined metadata
     meta = {
         "h1_index": {
             "n_facts": len(h1_facts),
             "embedding_dim": h1_embeddings.shape[1],
-            "relationship_format": "single",  # ✓ Indicate format
+            "relationship_format": "single",
             "unique_relationships": len(h1_rel_counter),
             "relationship_distribution": dict(h1_rel_counter.most_common(20)),
             "diagnosis_targets": sum(h1_diagnosis_flags)
@@ -792,7 +812,7 @@ def save_separate_indexes(
         "h2_index": {
             "n_facts": len(h2_facts),
             "embedding_dim": h2_embeddings.shape[1],
-            "relationship_format": "dual",  # ✓ Indicate format
+            "relationship_format": "dual",
             "unique_first_relationships": len(h2_first_counter),
             "unique_second_relationships": len(h2_second_counter),
             "first_relationship_distribution": dict(h2_first_counter.most_common(20)),
@@ -822,7 +842,7 @@ def save_separate_indexes(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Build separate H1/H2 fact indexes")
+    parser = argparse.ArgumentParser(description="Build history-aware medical fact indexes")
     parser.add_argument("--train_data", required=True)
     parser.add_argument("--val_data", required=True)
     parser.add_argument("--test_data", required=True)
@@ -846,7 +866,7 @@ def main():
     args = parser.parse_args()
     
     log.info("="*80)
-    log.info("MEDICAL FACT INDEX BUILDER - SEPARATE H1/H2")
+    log.info("HISTORY-AWARE MEDICAL FACT INDEX BUILDER")
     log.info("="*80)
     
     # Load mappings
@@ -873,7 +893,7 @@ def main():
         G = pickle.load(f)
     log.info(f"✓ Loaded KG: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
     
-    # Mine H1 paths
+    # Mine paths
     log.info("\n" + "="*80)
     log.info("MINING H1 PATHS")
     log.info("="*80)
@@ -884,7 +904,6 @@ def main():
         max_diagnosis_paths_per_target=args.max_h1_diagnosis_per_target
     )
     
-    # Mine H2 paths
     log.info("\n" + "="*80)
     log.info("MINING H2 PATHS")
     log.info("="*80)
@@ -895,7 +914,7 @@ def main():
         max_diagnosis_paths_per_target=args.max_h2_diagnosis_per_target
     )
     
-    # Linearize paths
+    # Linearize
     log.info("\n" + "="*80)
     log.info("LINEARIZING PATHS")
     log.info("="*80)
@@ -909,14 +928,13 @@ def main():
             h1_relationships.append(rel)
             h1_diagnosis_flags.append(is_diag)
     
-    # Process H2 paths (dual relationships)
     log.info("Linearizing H2 paths...")
     h2_facts, h2_relationships, h2_diagnosis_flags = [], [], []
     for path in tqdm(h2_paths, desc="H2 linearization"):
-        fact, rels, is_diag = linearize_h2_path_with_metadata(path)  # ✓ rels is now a list
+        fact, rels, is_diag = linearize_h2_path_with_metadata(path)
         if fact:
             h2_facts.append(fact)
-            h2_relationships.append(rels)  # ✓ List of two strings
+            h2_relationships.append(rels)
             h2_diagnosis_flags.append(is_diag)
     
     log.info(f"✓ H1: {len(h1_facts)} facts")
@@ -944,7 +962,9 @@ def main():
         "diagnosis_statistics": diagnosis_stats,
         "h1_statistics": h1_stats,
         "h2_statistics": h2_stats,
-        "sapbert_model": args.sapbert_model
+        "sapbert_model": args.sapbert_model,
+        "history_aware": True,
+        "past_diagnoses_as_sources": True
     }
     
     save_separate_indexes(
@@ -955,7 +975,7 @@ def main():
     )
     
     log.info("\n" + "="*80)
-    log.info(" COMPLETE!")
+    log.info("✅ COMPLETE!")
     log.info("="*80)
 
 if __name__ == "__main__":

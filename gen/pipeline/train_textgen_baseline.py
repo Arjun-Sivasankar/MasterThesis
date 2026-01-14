@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-train_textgen_ragKG.py
-Unified training script for RAG-enhanced diagnosis generation.
+train_textgen_baseline.py
+Training script for baseline diagnosis generation (no KG retrieval).
 """
 
 import os, json, time, argparse, logging, sys
@@ -54,16 +54,16 @@ log.addFilter(RankFilter())
 # DATASET
 # ============================================================================
 
-class RAGTextGenDataset(Dataset):
+class SFTTextGenDataset(Dataset):
+    """Dataset for supervised fine-tuning (baseline, no KG facts)."""
+    
     def __init__(self, jsonl_path: str, tokenizer, 
                  max_len: int = 5120,
-                 max_prompt_tokens: int = 3072,
-                 max_kg_tokens: int = 1500,
+                 max_prompt_tokens: int = 4572,
                  max_target_tokens: int = 512):
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.max_prompt_tokens = max_prompt_tokens
-        self.max_kg_tokens = max_kg_tokens
         self.max_target_tokens = max_target_tokens
         self.examples = []
         
@@ -74,99 +74,33 @@ class RAGTextGenDataset(Dataset):
         
         if is_main_process():
             log.info(f"Loaded {len(self.examples)} examples from {jsonl_path}")
-            log.info(f"  Tokens: prompt={max_prompt_tokens}, kg={max_kg_tokens}, target={max_target_tokens}")
+            log.info(f"  Max prompt tokens: {max_prompt_tokens}")
+            log.info(f"  Max target tokens: {max_target_tokens}")
+            log.info(f"  Max sequence length: {max_len}")
     
     def __len__(self):
         return len(self.examples)
     
-    def _split_prompt_and_kg(self, full_prompt: str):
-        kg_marker = "[KNOWLEDGE GRAPH FACTS]"
-        task_marker = "[TASK]"
-        
-        if kg_marker not in full_prompt:
-            return full_prompt, ""
-        
-        parts = full_prompt.split(kg_marker, 1)
-        before_kg = parts[0]
-        
-        if len(parts) > 1 and task_marker in parts[1]:
-            kg_and_after = parts[1].split(task_marker, 1)
-            kg_section = kg_marker + kg_and_after[0]
-            after_kg = task_marker + kg_and_after[1] if len(kg_and_after) > 1 else ""
-            return before_kg + after_kg, kg_section
-        
-        return before_kg, kg_marker + parts[1] if len(parts) > 1 else ""
-    
-    def _truncate_kg_section(self, kg_section: str, max_tokens: int):
-        if not kg_section or max_tokens == 0:
-            return ""
-        
-        lines = kg_section.split('\n')
-        header_lines = []
-        fact_lines = []
-        
-        in_facts = False
-        for line in lines:
-            if '[KNOWLEDGE GRAPH FACTS]' in line:
-                header_lines.append(line)
-                in_facts = True
-            elif in_facts and line.strip() and line.strip()[0].isdigit():
-                fact_lines.append(line)
-            elif in_facts:
-                header_lines.append(line)
-        
-        header_text = '\n'.join(header_lines)
-        header_tokens = self.tokenizer.encode(header_text, add_special_tokens=False)
-        available = max_tokens - len(header_tokens)
-        
-        if available <= 0:
-            return header_text
-        
-        kept_facts = []
-        current = 0
-        for fact in fact_lines:
-            tokens = self.tokenizer.encode(fact + '\n', add_special_tokens=False)
-            if current + len(tokens) <= available:
-                kept_facts.append(fact)
-                current += len(tokens)
-            else:
-                break
-        
-        return header_text + '\n' + '\n'.join(kept_facts) if kept_facts else header_text
-    
     def __getitem__(self, idx):
         example = self.examples[idx]
-        full_prompt = example['prompt']
+        prompt = example['prompt']
         target = example['target']
         
-        prompt_part, kg_part = self._split_prompt_and_kg(full_prompt)
-        
-        prompt_tokens = self.tokenizer.encode(prompt_part, add_special_tokens=False)
+        # Truncate prompt if needed
+        prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
         if len(prompt_tokens) > self.max_prompt_tokens:
             prompt_tokens = prompt_tokens[:self.max_prompt_tokens]
-            prompt_part = self.tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+            prompt = self.tokenizer.decode(prompt_tokens, skip_special_tokens=True)
         
-        if kg_part and self.max_kg_tokens > 0:
-            kg_part = self._truncate_kg_section(kg_part, self.max_kg_tokens)
-        elif self.max_kg_tokens == 0:
-            kg_part = ""
-        
-        if kg_part:
-            if "[TASK]" in prompt_part:
-                parts = prompt_part.split("[TASK]", 1)
-                reconstructed = parts[0] + "\n" + kg_part + "\n[TASK]" + parts[1]
-            else:
-                reconstructed = prompt_part + "\n" + kg_part
-        else:
-            reconstructed = prompt_part
-        
+        # Truncate target if needed
         target_tokens = self.tokenizer.encode(target, add_special_tokens=False)
         if len(target_tokens) > self.max_target_tokens:
             target_tokens = target_tokens[:self.max_target_tokens]
             target = self.tokenizer.decode(target_tokens, skip_special_tokens=True)
         
+        # Build conversation
         conversation = [
-            {"role": "user", "content": reconstructed},
+            {"role": "user", "content": prompt},
             {"role": "assistant", "content": target}
         ]
         
@@ -182,6 +116,7 @@ class RAGTextGenDataset(Dataset):
         input_ids = encodings['input_ids']
         labels = input_ids.copy()
         
+        # Mask prompt tokens (only train on assistant response)
         try:
             assistant_tokens = self.tokenizer.encode("assistant", add_special_tokens=False)
             for i in range(len(input_ids) - len(assistant_tokens)):
@@ -189,6 +124,7 @@ class RAGTextGenDataset(Dataset):
                     labels[:i+len(assistant_tokens)+2] = [-100] * (i+len(assistant_tokens)+2)
                     break
             else:
+                # Fallback: mask first 80%
                 mask_len = int(len(labels) * 0.8)
                 labels[:mask_len] = [-100] * mask_len
         except:
@@ -206,6 +142,7 @@ class RAGTextGenDataset(Dataset):
 # ============================================================================
 
 def pad_collate(features, tokenizer):
+    """Pad batch to max length."""
     max_len = max(len(f['input_ids']) for f in features)
     
     batch = {'input_ids': [], 'attention_mask': [], 'labels': []}
@@ -223,12 +160,12 @@ def pad_collate(features, tokenizer):
     }
 
 # ============================================================================
-# MODEL LOADING - Memory Optimized for 5120 tokens
+# MODEL LOADING
 # ============================================================================
 
 def load_llm_with_lora(model_name: str, lora_r: int = 16, lora_alpha: int = 32,
                        lora_dropout: float = 0.1):
-    """Load model with LoRA - memory optimized for long sequences."""
+    """Load model with LoRA - memory optimized."""
     
     if is_main_process():
         log.info(f"Loading model: {model_name}")
@@ -255,11 +192,11 @@ def load_llm_with_lora(model_name: str, lora_r: int = 16, lora_alpha: int = 32,
             attn_implementation="flash_attention_2",
         )
         if is_main_process():
-            log.info("  ✓ Using Flash Attention 2")
+            log.info("  Using Flash Attention 2")
     except Exception as e:
         if is_main_process():
             log.warning(f"  Flash Attention 2 not available: {e}")
-            log.info("  Using eager attention (will use more memory)")
+            log.info("  Using eager attention")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -275,9 +212,9 @@ def load_llm_with_lora(model_name: str, lora_r: int = 16, lora_alpha: int = 32,
     model.config.use_cache = False
     
     if is_main_process():
-        log.info("  ✓ Gradient checkpointing enabled")
+        log.info("  Gradient checkpointing enabled")
     
-    # LoRA
+    # LoRA configuration
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
@@ -290,7 +227,7 @@ def load_llm_with_lora(model_name: str, lora_r: int = 16, lora_alpha: int = 32,
     model = get_peft_model(model, lora_config)
     
     if is_main_process():
-        log.info("  ✓ LoRA adapters added")
+        log.info("  LoRA adapters added")
         model.print_trainable_parameters()
     
     return model, tokenizer
@@ -300,6 +237,8 @@ def load_llm_with_lora(model_name: str, lora_r: int = 16, lora_alpha: int = 32,
 # ============================================================================
 
 class LoggingCallback(TrainerCallback):
+    """Custom logging callback."""
+    
     def __init__(self):
         self.train_losses = []
     
@@ -348,6 +287,8 @@ class LoggingCallback(TrainerCallback):
 # ============================================================================
 
 class SafeTrainer(Trainer):
+    """Trainer with safe loss computation."""
+    
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.get("labels")
         if labels is not None and (labels != -100).sum().item() == 0:
@@ -360,6 +301,7 @@ class SafeTrainer(Trainer):
 # ============================================================================
 
 def finalize_distributed():
+    """Clean up distributed training."""
     import datetime, gc
     try:
         if dist.is_available() and dist.is_initialized():
@@ -388,21 +330,30 @@ def finalize_distributed():
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Train baseline diagnosis generation model (no KG)"
+    )
     
-    parser.add_argument("--train_jsonl", required=True)
-    parser.add_argument("--val_jsonl", required=True)
-    parser.add_argument("--llm", default="meta-llama/Llama-3.1-8B-Instruct")
+    # Data
+    parser.add_argument("--train_jsonl", required=True, help="Training JSONL file")
+    parser.add_argument("--val_jsonl", required=True, help="Validation JSONL file")
+    parser.add_argument("--llm", default="meta-llama/Llama-3.1-8B-Instruct",
+                       help="Base LLM model")
     
-    parser.add_argument("--max_len", type=int, default=5120)
-    parser.add_argument("--max_prompt_tokens", type=int, default=3072)
-    parser.add_argument("--max_kg_tokens", type=int, default=1500)
-    parser.add_argument("--max_target_tokens", type=int, default=512)
+    # Token budgets
+    parser.add_argument("--max_len", type=int, default=5120,
+                       help="Maximum sequence length")
+    parser.add_argument("--max_prompt_tokens", type=int, default=4572,
+                       help="Maximum tokens for prompt (clinical notes)")
+    parser.add_argument("--max_target_tokens", type=int, default=512,
+                       help="Maximum tokens for target (diagnoses)")
     
+    # LoRA
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     
+    # Training
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--per_device_train_batch_size", type=int, default=1)
     parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
@@ -410,30 +361,45 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
-    parser.add_argument("--early_stop", type=int, default=1)
+    parser.add_argument("--early_stop", type=int, default=1,
+                       help="Enable early stopping (0=disable, 1=enable)")
     parser.add_argument("--patience", type=int, default=3)
     
-    parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--save_adapter", action="store_true")
-    parser.add_argument("--adapter_dir", default="")
-    parser.add_argument("--experiment_name", default="")
+    # Output
+    parser.add_argument("--out_dir", required=True,
+                       help="Output directory for checkpoints")
+    parser.add_argument("--save_adapter", action="store_true",
+                       help="Save LoRA adapter")
+    parser.add_argument("--adapter_dir", default="",
+                       help="Directory to save adapter")
+    parser.add_argument("--experiment_name", default="baseline",
+                       help="Experiment name")
     parser.add_argument("--local_rank", type=int, default=-1)
     
     args = parser.parse_args()
     
     if is_main_process():
         log.info("=" * 80)
-        log.info("TRAINING CONFIGURATION")
+        log.info("BASELINE TRAINING CONFIGURATION")
         log.info("=" * 80)
         log.info(f"Experiment: {args.experiment_name}")
         log.info(f"Train: {args.train_jsonl}")
         log.info(f"Val:   {args.val_jsonl}")
-        log.info(f"\nTokens: total={args.max_len}, prompt={args.max_prompt_tokens}, "
-                 f"kg={args.max_kg_tokens}, target={args.max_target_tokens}")
-        log.info(f"\nTraining: {args.epochs} epochs, LR={args.learning_rate}")
-        log.info(f"LoRA: r={args.lora_r}, alpha={args.lora_alpha}")
+        log.info(f"\nToken Budget:")
+        log.info(f"  Max total:  {args.max_len}")
+        log.info(f"  Prompt:     {args.max_prompt_tokens} (clinical notes)")
+        log.info(f"  Target:     {args.max_target_tokens} (diagnoses)")
+        log.info(f"  Overhead:   {args.max_len - args.max_prompt_tokens - args.max_target_tokens} (chat template)")
+        log.info(f"\nTraining:")
+        log.info(f"  Epochs:     {args.epochs}")
+        log.info(f"  Batch size: {args.per_device_train_batch_size}")
+        log.info(f"  Grad accum: {args.grad_accum}")
+        log.info(f"  LR:         {args.learning_rate}")
+        log.info(f"\nLoRA:")
+        log.info(f"  r={args.lora_r}, alpha={args.lora_alpha}, dropout={args.lora_dropout}")
         log.info("=" * 80)
     
+    # Load model
     model, tokenizer = load_llm_with_lora(
         args.llm, args.lora_r, args.lora_alpha, args.lora_dropout
     )
@@ -441,18 +407,20 @@ def main():
     if is_main_process():
         log.info("\nLoading datasets...")
     
-    train_dataset = RAGTextGenDataset(
+    # Load datasets
+    train_dataset = SFTTextGenDataset(
         args.train_jsonl, tokenizer, args.max_len,
-        args.max_prompt_tokens, args.max_kg_tokens, args.max_target_tokens
+        args.max_prompt_tokens, args.max_target_tokens
     )
-    val_dataset = RAGTextGenDataset(
+    val_dataset = SFTTextGenDataset(
         args.val_jsonl, tokenizer, args.max_len,
-        args.max_prompt_tokens, args.max_kg_tokens, args.max_target_tokens
+        args.max_prompt_tokens, args.max_target_tokens
     )
     
     if is_main_process():
-        log.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+        log.info(f"Train: {len(train_dataset):,}, Val: {len(val_dataset):,}")
     
+    # Training arguments
     training_args = TrainingArguments(
         output_dir=args.out_dir,
         num_train_epochs=args.epochs,
@@ -476,7 +444,7 @@ def main():
         gradient_checkpointing=True,
         remove_unused_columns=False,
         optim="adamw_torch",
-        bf16=True,  # Always use bfloat16
+        bf16=True,
         
         ddp_backend="nccl",
         ddp_find_unused_parameters=False,
@@ -491,10 +459,12 @@ def main():
         save_safetensors=True,
     )
     
+    # Callbacks
     callbacks = [LoggingCallback()]
     if args.early_stop:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.patience))
     
+    # Trainer
     trainer = SafeTrainer(
         model=model,
         args=training_args,
@@ -505,7 +475,7 @@ def main():
     )
     
     if is_main_process():
-        log.info("\n Starting training...")
+        log.info("\nStarting training...")
     
     t0 = time.time()
     
@@ -513,22 +483,23 @@ def main():
         trainer.train()
         
     finally:
+        # Save adapter
         if args.save_adapter and args.adapter_dir and is_main_process():
             try:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 
                 os.makedirs(args.adapter_dir, exist_ok=True)
-                log.info(f"\n Saving adapter to {args.adapter_dir}...")
+                log.info(f"\nSaving adapter to {args.adapter_dir}...")
                 trainer.model.save_pretrained(args.adapter_dir)
                 tokenizer.save_pretrained(args.adapter_dir)
                 
                 info = {
                     'model': args.llm,
+                    'mode': 'baseline',
                     'epochs': args.epochs,
                     'max_len': args.max_len,
                     'max_prompt_tokens': args.max_prompt_tokens,
-                    'max_kg_tokens': args.max_kg_tokens,
                     'max_target_tokens': args.max_target_tokens,
                     'training_time_min': (time.time() - t0) / 60
                 }
@@ -536,12 +507,12 @@ def main():
                 with open(Path(args.adapter_dir) / 'training_info.json', 'w') as f:
                     json.dump(info, f, indent=2)
                 
-                log.info(" Adapter saved")
+                log.info("Adapter saved")
             except Exception as e:
                 log.warning(f"Adapter save failed: {e}")
         
         if is_main_process():
-            log.info(f"\n Training completed in {(time.time() - t0) / 60:.2f} min")
+            log.info(f"\nTraining completed in {(time.time() - t0) / 60:.2f} min")
         
         finalize_distributed()
     

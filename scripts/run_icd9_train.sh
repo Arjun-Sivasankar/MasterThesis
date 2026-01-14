@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=diffsize_train
+#SBATCH --job-name=codegen_train
 #SBATCH --partition=capella            # GPU partition
 #SBATCH --gres=gpu:3                   # 3 GPUs
 #SBATCH --cpus-per-task=8              # CPU cores for data loading
 #SBATCH --nodes=1
 #SBATCH --mem=64G                      # RAM
 #SBATCH --time=24:00:00                # Max walltime
-#SBATCH --output=logs/CodeGen-DDP/train_ddp_%j.out    # stdout+stderr log
+#SBATCH --output=logs/CodeGen-DDP/train_ddp_new_%j.out    # stdout+stderr log
 ## SBATCH --output=logs/CodeGen-DDP/%j.out    # stdout+stderr log
 
 # --- 1) Load modules ---
@@ -44,9 +44,13 @@ echo "[INFO] Script to be run: $SCRIPT"
 EPOCHS=10
 echo "[INFO] Training for $EPOCHS epoch(s)"
 
-LLM=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/Llama-3.1-8B-Instruct
+# LLM=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/Llama-3.1-8B-Instruct
 # LLM=meta-llama/Llama-3.2-1B-Instruct
+LLM=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/Meditron3-8B
 echo "[INFO] Using LLM model: ${LLM}"
+
+EARLY_STOP=1
+echo "[INFO] Early stopping: ${EARLY_STOP}"
 
 # --- 6) Run training ---
 start=$(date +%s)
@@ -54,11 +58,11 @@ echo "[INFO] Job started at $(date)"
 
 echo "[INFO] Starting ICD-9 finetuning (DDP - With diff model) ...."
 srun torchrun --standalone --nproc_per_node=${GPUS} ${SCRIPT} \
-    --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/train_df.pkl \
-    --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/val_df.pkl \
-    --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/icd9/test_df.pkl \
+    --train_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/final_data_cleaned/train_df.pkl \
+    --val_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/final_data_cleaned/val_df.pkl \
+    --test_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/final_data_cleaned/test_df.pkl \
     --icd9_pickle /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/dataset/codes/icd9.pkl \
-    --llama_model /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/models/Llama-3.1-8B-Instruct \
+    --llama_model ${LLM} \
     --train_size 54981 \
     --eval_sample_size 100 \
     --per_device_train_batch_size 1 \
@@ -66,7 +70,8 @@ srun torchrun --standalone --nproc_per_node=${GPUS} ${SCRIPT} \
     --test_batch_size 16 \
     --grad_accum 16 \
     --epochs ${EPOCHS} \
-    --use_complete_icd9 1
+    --use_complete_icd9 1 \
+    --early_stop ${EARLY_STOP} \
 
 
 # echo "[INFO] Starting ICD-9 finetuning..."

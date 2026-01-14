@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-test_textgen_ragKG.py
-Testing script for RAG-enhanced diagnosis generation models.
+test_textgen_baseline.py
+Testing script for baseline diagnosis generation models (no KG retrieval).
+Maps generated text to ICD-9 codes using SapBERT encoder.
+Extracts gold codes from 'target_codes' field in JSONL.
+Supports subset evaluation and comprehensive metrics.
 """
 
 import os, json, time, argparse, logging, sys, glob, pickle, re
@@ -17,7 +20,9 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from peft import PeftModel
 from sklearn.metrics import precision_recall_fscore_support, precision_score, recall_score, f1_score
 
-from common_textgen import (
+sys.path.insert(0, '/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/gen/pipeline/')
+
+from common_textgen_util import (
     log, is_main_process, world_size, local_rank,
     ICDMapper, format_icd9, is_valid_icd9,
     restrict_to, multihot, eval_pack,
@@ -53,31 +58,20 @@ def cleanup_dist():
 # ============================================================================
 # CODE EXTRACTION & FORMATTING
 # ============================================================================
+
 def update_prompt_k(prompt: str, new_k: int) -> str:
-    """
-    Update the 'Maximum: X lines' instruction in prompt to new k value.
-    
-    Args:
-        prompt: Original prompt with "Maximum: X lines" instruction
-        new_k: New maximum number of diagnosis lines
-    
-    Returns:
-        Updated prompt with new k value
-    """
+    """Update the 'Maximum: X lines' instruction in prompt to new k value."""
     import re
     pattern = r'(- Maximum:\s*)\d+(\s*lines?)'
     replacement = rf'\g<1>{new_k}\g<2>'
-    
     updated = re.sub(pattern, replacement, prompt, flags=re.IGNORECASE)
     
-    # Verify the replacement worked
     if not re.search(pattern, prompt):
         log.warning(f"Could not find 'Maximum: X lines' pattern in prompt")
     elif updated == prompt:
         log.warning(f"Prompt k update failed - prompt unchanged")
     
     return updated
-
 
 def _clean_diagnosis_term(term: str) -> str:
     term = term.strip()
@@ -329,10 +323,11 @@ def _pretty_print_block(title: str, d: dict):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_jsonl", required=True, help="Test JSONL file")
-    parser.add_argument("--subset_size", type=int, default=None, help="Test on subset (e.g., 100 samples). None = full test set")
+    parser.add_argument("--subset_size", type=int, default=None, help="Test on subset. None = full test set")
     parser.add_argument("--subset_seed", type=int, default=42, help="Random seed for subset sampling")
     parser.add_argument("--base_model", required=True, help="Base model path")
-    parser.add_argument("--adapter_dir", default="", help="Adapter directory")
+    parser.add_argument("--adapter_dir", default="", help="Adapter directory (optional for base_model_only mode)")
+    parser.add_argument("--base_model_only", action="store_true", help="Evaluate base model without adapter")
     parser.add_argument("--max_len", type=int, default=5120)
     parser.add_argument("--gen_max_new", type=int, default=128)
     parser.add_argument("--gen_batch_size", type=int, default=4)
@@ -341,8 +336,8 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=50)
-    parser.add_argument("--N_max_terms", type=int, default=12, help="Max diagnosis terms to extract from generation")
-    parser.add_argument("--icd_index_dir", required=True, help="Directory with FAISS index for ICD-9 codes")
+    parser.add_argument("--N_max_terms", type=int, default=12, help="Max diagnosis terms to extract")
+    parser.add_argument("--icd_index_dir", required=True, help="FAISS index for ICD-9 codes")
     parser.add_argument("--encoder_model", default="cambridgeltl/SapBERT-from-PubMedBERT-fulltext")
     parser.add_argument("--faiss_rows", type=int, default=50)
     parser.add_argument("--tau_cos", type=float, default=0.40)
@@ -350,7 +345,7 @@ def main():
     parser.add_argument("--w_cos", type=float, default=0.6)
     parser.add_argument("--w_fuz", type=float, default=0.4)
     parser.add_argument("--distributed", action="store_true")
-    parser.add_argument("--tmp_dir", default="runs_textgen_rag/test_shards")
+    parser.add_argument("--tmp_dir", default="runs_textgen/baseline_test_shards")
     parser.add_argument("--out_metrics", required=True, help="Output metrics JSON path")
     parser.add_argument("--print_samples", type=int, default=5)
     parser.add_argument("--use_bf16", action="store_true")
@@ -364,21 +359,32 @@ def main():
     
     args = parser.parse_args()
 
+    # Validate arguments
+    if not args.base_model_only and not args.adapter_dir:
+        log.error("ERROR: --adapter_dir is required unless --base_model_only is set")
+        return 1
+
     # ========================================================================
     # SETUP
     # ========================================================================
     if is_main_process():
         log.info("=" * 80)
-        log.info("RAG TEXT GENERATION - TESTING (with SapBERT Mapping)")
+        if args.base_model_only:
+            log.info("BASELINE TESTING - BASE MODEL ONLY (ABLATION)")
+        else:
+            log.info("BASELINE TESTING (with SapBERT Mapping)")
         log.info("=" * 80)
         log.info(f"Test data: {args.test_jsonl}")
         log.info(f"Base model: {args.base_model}")
-        log.info(f"Adapter: {args.adapter_dir}")
+        if args.base_model_only:
+            log.info(f"ABLATION MODE: Using base model only (no adapter)")
+        else:
+            log.info(f"Adapter: {args.adapter_dir}")
         log.info(f"Decoding: {args.decoding}")
         log.info(f"ICD Index: {args.icd_index_dir}")
         log.info(f"Encoder: {args.encoder_model}")
         if args.subset_size:
-            log.info(f"  SUBSET MODE: Testing on {args.subset_size} samples only")
+            log.info(f"SUBSET MODE: Testing on {args.subset_size} samples only")
         log.info("=" * 80)
 
     # Load test data
@@ -390,26 +396,26 @@ def main():
     total_examples = len(examples)
 
     if is_main_process():
-        log.info(f"\n Loaded {total_examples} examples from {args.test_jsonl}")
+        log.info(f"\nLoaded {total_examples} examples from {args.test_jsonl}")
         if examples:
             example_keys = list(examples[0].keys())
-            log.info(f"   Available fields: {example_keys}")
+            log.info(f"  Available fields: {example_keys}")
             if 'target_codes' in examples[0]:
                 sample_codes = examples[0]['target_codes']
                 if isinstance(sample_codes, list):
-                    log.info(f"   Sample target_codes (first example): {sample_codes[:5]}...")
+                    log.info(f"  Sample target_codes: {sample_codes[:5]}...")
                 else:
-                    log.info(f"   Sample target_codes (first example): {sample_codes}")
+                    log.info(f"  Sample target_codes: {sample_codes}")
 
-            # Check original k value in prompts
+            # Check original k value
             if 'prompt' in examples[0]:
                 sample_prompt = examples[0]['prompt']
                 match = re.search(r'- Maximum:\s*(\d+)\s*lines?', sample_prompt, re.IGNORECASE)
                 if match:
                     original_k = int(match.group(1))
-                    log.info(f"   Original k in prompts: {original_k}")
+                    log.info(f"  Original k in prompts: {original_k}")
                     if args.update_prompt_k and args.N_max_terms != original_k:
-                        log.info(f"    Will update prompts from k={original_k} to k={args.N_max_terms}")
+                        log.info(f"  Will update prompts from k={original_k} to k={args.N_max_terms}")
 
     # Subset sampling
     if args.subset_size and args.subset_size < len(examples):
@@ -417,24 +423,24 @@ def main():
         subset_indices = np.random.choice(len(examples), args.subset_size, replace=False)
         examples = [examples[i] for i in sorted(subset_indices)]
         if is_main_process():
-            log.info(f"\n Subset sampling:")
-            log.info(f"   Total in file: {total_examples}")
-            log.info(f"   Testing on: {len(examples)} samples (seed={args.subset_seed})")
+            log.info(f"\nSubset sampling:")
+            log.info(f"  Total in file: {total_examples}")
+            log.info(f"  Testing on: {len(examples)} samples (seed={args.subset_seed})")
     else:
         if is_main_process():
-            log.info(f"\n Testing on full set: {len(examples)} samples")
+            log.info(f"\nTesting on full set: {len(examples)} samples")
 
-    # Extract prompts, targets, and gold codes properly
+    # Extract prompts and gold codes
     prompts = [ex['prompt'] for ex in examples]
     targets = [ex.get('target', '') for ex in examples]
 
-    # Update k value in prompt if requested
+    # Update k value if requested
     if args.update_prompt_k:
         prompts = [update_prompt_k(p, args.N_max_terms) for p in prompts]
 
-    # Extract gold codes from JSONL examples
+    # Extract gold codes
     if is_main_process():
-        log.info(f"\n Extracting gold codes from examples...")
+        log.info(f"\nExtracting gold codes from examples...")
     gold_codes = []
     extraction_stats = {'target_codes': 0, 'other_fields': 0, 'empty': 0}
     for ex in examples:
@@ -451,38 +457,35 @@ def main():
         log.info(f"[DATA] Test size: {len(examples)}")
         log.info(f"[DATA] Eval label space: {len(all_codes)} codes (FULL)")
         if len(all_codes) == 0:
-            log.error(" ERROR: No gold codes found in test set!")
-            log.error("   Expected JSONL format:")
-            log.error('   {"prompt": "...", "target": "...", "target_codes": ["410.71", "414.01", ...]}')
-            log.error(f"   Found fields: {list(examples[0].keys())}")
+            log.error("ERROR: No gold codes found in test set!")
+            log.error("  Expected JSONL format:")
+            log.error('  {"prompt": "...", "target": "...", "target_codes": ["410.71", "414.01", ...]}')
+            log.error(f"  Found fields: {list(examples[0].keys())}")
             return 1
 
-    if is_main_process():
-        # Show sample prompt transformation
-        if args.update_prompt_k:
-            log.info("\n Sample prompt transformation:")
-            log.info("=" * 80)
-            original = examples[0]['prompt']
-            updated = prompts[0]
-            
-            # Show the relevant part
-            orig_match = re.search(r'\[FORMAT\].*?\[OUTPUT\]', original, re.DOTALL)
-            upd_match = re.search(r'\[FORMAT\].*?\[OUTPUT\]', updated, re.DOTALL)
-            
-            if orig_match and upd_match:
-                log.info("ORIGINAL:")
-                log.info(orig_match.group(0))
-                log.info("\nUPDATED:")
-                log.info(upd_match.group(0))
-            log.info("=" * 80)
+    if is_main_process() and args.update_prompt_k:
+        log.info("\nSample prompt transformation:")
+        log.info("=" * 80)
+        original = examples[0]['prompt']
+        updated = prompts[0]
+        
+        orig_match = re.search(r'\[FORMAT\].*?\[OUTPUT\]', original, re.DOTALL)
+        upd_match = re.search(r'\[FORMAT\].*?\[OUTPUT\]', updated, re.DOTALL)
+        
+        if orig_match and upd_match:
+            log.info("ORIGINAL:")
+            log.info(orig_match.group(0))
+            log.info("\nUPDATED:")
+            log.info(upd_match.group(0))
+        log.info("=" * 80)
 
     # ========================================================================
     # MODEL LOADING
     # ========================================================================
     dtype = torch.bfloat16 if (args.use_bf16 and torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8) else torch.float16
-
+    
     if is_main_process():
-        log.info(f"\n Loading tokenizer from base model: {args.base_model}...")
+        log.info(f"\nLoading tokenizer from base model: {args.base_model}...")
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     
     if tokenizer.pad_token is None:
@@ -491,8 +494,8 @@ def main():
     tokenizer.padding_side = "left"
     
     if is_main_process():
-        log.info(f" Loading base model: {args.base_model}")
-        log.info(f"   dtype: {dtype}")
+        log.info(f"Loading base model: {args.base_model}")
+        log.info(f"  dtype: {dtype}")
     
     base_model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
@@ -500,24 +503,29 @@ def main():
         low_cpu_mem_usage=True
     )
     
-    if is_main_process():
-        log.info(f" Loading adapter from {args.adapter_dir}")
-    model = PeftModel.from_pretrained(base_model, args.adapter_dir)
+    if args.base_model_only:
+        model = base_model
+        if is_main_process():
+            log.info(f"Using BASE MODEL ONLY (no adapter) for ablation")
+    else:
+        if is_main_process():
+            log.info(f"Loading adapter from {args.adapter_dir}")
+        model = PeftModel.from_pretrained(base_model, args.adapter_dir)
     
     model.config.use_cache = True
     dev = torch.device(f"cuda:{local_rank()}" if torch.cuda.is_available() else "cpu")
     model.to(dev).eval()
     if is_main_process():
-        log.info(f" Model loaded on device: {dev}")
+        log.info(f"Model loaded on device: {dev}")
 
     # ========================================================================
     # INITIALIZE SAPBERT MAPPER
     # ========================================================================
     if is_main_process():
-        log.info(f"\n Initializing SapBERT mapper...")
-        log.info(f"   Index dir: {args.icd_index_dir}")
-        log.info(f"   Encoder: {args.encoder_model}")
-        log.info(f"   Weights: w_cos={args.w_cos}, w_fuz={args.w_fuz}")
+        log.info(f"\nInitializing SapBERT mapper...")
+        log.info(f"  Index dir: {args.icd_index_dir}")
+        log.info(f"  Encoder: {args.encoder_model}")
+        log.info(f"  Weights: w_cos={args.w_cos}, w_fuz={args.w_fuz}")
     mapper = ICDMapper(
         index_dir=args.icd_index_dir,
         encoder_model_cli=args.encoder_model,
@@ -528,7 +536,7 @@ def main():
         faiss_rows=args.faiss_rows
     )
     if is_main_process():
-        log.info(" Mapper initialized")
+        log.info("Mapper initialized")
 
     # ========================================================================
     # DISTRIBUTED SHARDING
@@ -548,7 +556,7 @@ def main():
     # GENERATION
     # ========================================================================
     if is_main_process():
-        log.info(f"\n Generating predictions for {len(shard_prompts)} examples...")
+        log.info(f"\nGenerating predictions for {len(shard_prompts)} examples...")
     generated_texts = []
     bs = args.gen_batch_size
     t0 = time.time()
@@ -575,17 +583,17 @@ def main():
     # EXTRACT TERMS AND MAP TO ICD-9
     # ========================================================================
     if is_main_process():
-        log.info(f"\n Extracting diagnosis terms from generated text...")
+        log.info(f"\nExtracting diagnosis terms from generated text...")
     terms_lists = []
     for text in generated_texts:
         terms = extract_terms_from_generation(text, max_terms=args.N_max_terms)
         terms_lists.append(terms)
     if is_main_process():
-        log.info(f" Extracted terms from {len(terms_lists)} generations")
-        log.info(f"\n Mapping terms to ICD-9 codes using SapBERT...")
+        log.info(f"Extracted terms from {len(terms_lists)} generations")
+        log.info(f"\nMapping terms to ICD-9 codes using SapBERT...")
     pred_codes = mapper.map_terms(terms_lists)
     if is_main_process():
-        log.info(f" Mapping completed")
+        log.info(f"Mapping completed")
 
     # ========================================================================
     # SAVE SHARD
@@ -601,7 +609,7 @@ def main():
             "gold": shard_gold,
         }, f)
     if is_main_process():
-        log.info(f" Saved shard to {shard_path}")
+        log.info(f"Saved shard to {shard_path}")
     barrier()
 
     # ========================================================================
@@ -640,7 +648,7 @@ def main():
         parent_labels, Yg_par, Yp_par = add_parent_metrics_full(parent_metrics, gold_eval, pred_eval)
         metrics.update(parent_metrics)
         
-        # Sample-level set metrics
+        # Sample-level metrics
         sample_metrics = sample_level_metrics(gold_eval, pred_eval)
         metrics.update(sample_metrics)
         
@@ -787,7 +795,9 @@ def main():
             "config": {
                 "test_jsonl": args.test_jsonl,
                 "base_model": args.base_model,
-                "adapter_dir": args.adapter_dir,
+                "adapter_dir": args.adapter_dir if not args.base_model_only else "N/A (base model only)",
+                "base_model_only": args.base_model_only,
+                "mode": "baseline",
                 "decoding": args.decoding,
                 "num_beams": args.num_beams,
                 "max_len": args.max_len,

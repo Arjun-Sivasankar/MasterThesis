@@ -1,18 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=test_rag_textgen
+#SBATCH --job-name=test_baseline
 #SBATCH --partition=capella
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --nodes=1
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/Textgen-withKG-withRAG/test_textgen_rag_%j.out
+#SBATCH --output=logs/Textgen/test_baseline_%j.out
 
 set -e
 
 ### ============================================================================
-### SLURM SETTINGS
+### BASELINE TESTING CONFIGURATION
 ### ============================================================================
+# This script tests baseline diagnosis generation models (no KG retrieval)
+# Uses SapBERT for mapping generated text to ICD-9 codes
+### ============================================================================
+
+echo "========================================"
+echo "BASELINE TESTING"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Start time: $(date)"
+echo "========================================"
 
 ### 1) Modules
 module purge
@@ -20,7 +29,8 @@ module load release/24.04 GCCcore/11.3.0
 module load Python/3.10.4
 
 ### 2) Project dir
-cd /data/horse/ws/arsi805e-finetune/Thesis/MasterThesis || { echo "Project dir not found"; exit 1; }
+PROJECT_DIR=/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis
+cd "$PROJECT_DIR" || { echo "[ERROR] Project dir not found"; exit 1; }
 
 ### 3) Virtualenv
 source /data/horse/ws/arsi805e-venv/venvs/finetune/bin/activate
@@ -33,30 +43,22 @@ export TOKENIZERS_PARALLELISM=false
 export HF_DISABLE_PROGRESS_BAR=1
 export TRANSFORMERS_VERBOSITY=error
 
-SCRIPT=gen/withKG/test_textgen_ragKG.py
+SCRIPT=gen/pipeline/test_textgen_baseline.py
 echo "[INFO] Testing Script: ${SCRIPT}"
 
 ### ============================================================================
 ### CONFIGURATION
 ### ============================================================================
 
-# MODE: "rag_unweighted", "rag_weighted"
-MODE="rag_unweighted"
-# MODE="rag_weighted"
-
-# Path config for RAG modes
-H1=true
-H2=false
-COMBINED=false
-
-alpha=0.3  # For weighted RAG
+# Test mode
+BASE_MODEL_ONLY=false  
 
 # Model selection
 BASE_LLM=meta-llama/Llama-3.2-1B-Instruct
 # BASE_LLM=models/Llama-3.1-8B-Instruct
 # BASE_LLM=models/Meditron3-8B
 
-if [ "$BASE_LLM" = "models/Llama-3.1-8B-Instruct" ]; then
+if [ "$BASE_LLM" = "models/Llama-3.1-8B-Instruct" ] || [ "$BASE_LLM" = "meta-llama/Llama-3.1-8B-Instruct" ]; then
     LLM="llama3.1-8B"
 elif [ "$BASE_LLM" = "meta-llama/Llama-3.2-1B-Instruct" ]; then
     LLM="llama3.2-1B"
@@ -68,6 +70,10 @@ fi
 
 EPOCHS=10
 
+# Paths
+TEST_JSONL=dataset/baseline/test_baseline.jsonl
+ADAPTER_DIR=runs_textgen/baseline/${LLM}/adapter_${EPOCHS}
+
 # SapBERT Mapper paths
 ICD_INDEX=gen/pipeline/icd_index_v9
 ENCODER_MODEL=cambridgeltl/SapBERT-from-PubMedBERT-fulltext
@@ -76,53 +82,28 @@ ENCODER_MODEL=cambridgeltl/SapBERT-from-PubMedBERT-fulltext
 SUBSET_SIZE=0        # Set >0 for subset, 0 for full test set
 SUBSET_SEED=42
 
-# Bucket CSV paths (updated to use thesis_plots directory)
+# Bucket CSV paths
 TOP_CODES_CSV=./analysis_results/top_50_codes.csv
 BOTTOM_CODES_CSV=./analysis_results/bottom_50_codes.csv
 TOP_PARENTS_CSV=./analysis_results/top_50_category_levels.csv
 
-# Set path_config for RAG
-if [[ "$MODE" =~ ^(rag_unweighted|rag_weighted)$ ]]; then
-    if [ "$H1" = true ] && [ "$H2" = false ] && [ "$COMBINED" = false ]; then
-        path_config="h1"
-    elif [ "$H1" = false ] && [ "$H2" = true ] && [ "$COMBINED" = false ]; then
-        path_config="h2"
-    elif [ "$H1" = false ] && [ "$H2" = false ] && [ "$COMBINED" = true ]; then
-        path_config="combined"
-    else
-        echo "[ERROR] Invalid path configuration for RAG mode. Set H1, H2, or COMBINED."
-        exit 1
-    fi
-fi
-
-# Set paths based on MODE
-if [ "$MODE" = "rag_unweighted" ]; then
-    TEST_JSONL=dataset/preprocessed_rag_full/map_desc/${path_config}/unweighted/test_rag_${path_config}_unweighted.jsonl
-    ADAPTER_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_unweighted_adapter_${EPOCHS}
-    
+# Output paths
+if [ "$BASE_MODEL_ONLY" = true ]; then
     if [ "$SUBSET_SIZE" -gt 0 ] 2>/dev/null; then
-        OUT_METRICS=runs_textgen_rag/${path_config}/${LLM}/rag_unweighted_test_metrics_${EPOCHS}_subset${SUBSET_SIZE}.json
-        TMP_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_unweighted_test_shards_${EPOCHS}_subset${SUBSET_SIZE}
+        OUT_METRICS=runs_textgen/baseline/${LLM}/base_model_test_metrics_subset${SUBSET_SIZE}.json
+        TMP_DIR=runs_textgen/baseline/${LLM}/base_model_test_shards_subset${SUBSET_SIZE}
     else
-        OUT_METRICS=runs_textgen_rag/${path_config}/${LLM}/rag_unweighted_test_metrics_${EPOCHS}.json
-        TMP_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_unweighted_test_shards_${EPOCHS}
+        OUT_METRICS=runs_textgen/baseline/${LLM}/base_model_test_metrics.json
+        TMP_DIR=runs_textgen/baseline/${LLM}/base_model_test_shards
     fi
-
-elif [ "$MODE" = "rag_weighted" ]; then
-    TEST_JSONL=dataset/preprocessed_rag_full/map_desc/${path_config}/weighted_alpha${alpha}/test_rag_${path_config}_weighted_alpha${alpha}.jsonl
-    ADAPTER_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_weighted_adapter_${EPOCHS}
-    
-    if [ "$SUBSET_SIZE" -gt 0 ] 2>/dev/null; then
-        OUT_METRICS=runs_textgen_rag/${path_config}/${LLM}/rag_weighted_test_metrics_${EPOCHS}_subset${SUBSET_SIZE}.json
-        TMP_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_weighted_test_shards_${EPOCHS}_subset${SUBSET_SIZE}
-    else
-        OUT_METRICS=runs_textgen_rag/${path_config}/${LLM}/rag_weighted_test_metrics_${EPOCHS}.json
-        TMP_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_weighted_test_shards_${EPOCHS}
-    fi
-
 else
-    echo "[ERROR] Unknown MODE: $MODE"
-    exit 1
+    if [ "$SUBSET_SIZE" -gt 0 ] 2>/dev/null; then
+        OUT_METRICS=runs_textgen/baseline/${LLM}/baseline_test_metrics_${EPOCHS}_subset${SUBSET_SIZE}.json
+        TMP_DIR=runs_textgen/baseline/${LLM}/baseline_test_shards_${EPOCHS}_subset${SUBSET_SIZE}
+    else
+        OUT_METRICS=runs_textgen/baseline/${LLM}/baseline_test_metrics_${EPOCHS}.json
+        TMP_DIR=runs_textgen/baseline/${LLM}/baseline_test_shards_${EPOCHS}
+    fi
 fi
 
 # Generation config
@@ -145,7 +126,9 @@ W_FUZ=0.0
 PRINT_SAMPLES=5
 USE_BF16=1
 
+# (set to true to update prompt k to match N_MAX_TERMS)
 UPDATE_PROMPT_K=false
+
 ### ============================================================================
 ### DISPLAY CONFIGURATION
 ### ============================================================================
@@ -154,14 +137,17 @@ echo ""
 echo "=========================================================================="
 echo "TESTING CONFIGURATION"
 echo "=========================================================================="
-echo "Mode:           RAG (with Knowledge Graph)"
-echo "Variant:        ${MODE}"
-echo "Path config:    ${path_config}"
+echo "Mode:           BASELINE (no KG retrieval)"
+if [ "$BASE_MODEL_ONLY" = true ]; then
+    echo "ABLATION:       Base model only (no adapter)"
+fi
 echo "Test data:      ${TEST_JSONL}"
 echo "Base LLM:       ${BASE_LLM}"
 echo "LLM identifier: ${LLM}"
-echo "Adapter:        ${ADAPTER_DIR}"
-echo "Epochs:         ${EPOCHS}"
+if [ "$BASE_MODEL_ONLY" != true ]; then
+    echo "Adapter:        ${ADAPTER_DIR}"
+    echo "Epochs:         ${EPOCHS}"
+fi
 echo ""
 if [ "$SUBSET_SIZE" -gt 0 ] 2>/dev/null; then
     echo "SUBSET MODE:"
@@ -177,6 +163,7 @@ echo "  Num beams:    ${NUM_BEAMS}"
 echo "  Max new:      ${GEN_MAX_NEW}"
 echo "  Batch size:   ${GEN_BS}"
 echo "  Max terms:    ${N_MAX_TERMS}"
+echo "  Update k:     ${UPDATE_PROMPT_K}"
 echo "  Print samples: ${PRINT_SAMPLES}"
 echo ""
 echo "SAPBERT MAPPER:"
@@ -203,26 +190,25 @@ echo "==========================================================================
 echo ""
 
 ### ============================================================================
-### RUN TESTING
+### VALIDATION
 ### ============================================================================
-
-start=$(date +%s)
-echo "[INFO] Job started: $(date)"
-echo "[INFO] SLURM Job ID: ${SLURM_JOB_ID}"
-echo "[INFO] Node: ${SLURMD_NODENAME}"
-echo ""
 
 # Check if test data exists
 if [ ! -f "${TEST_JSONL}" ]; then
     echo "[ERROR] Test data not found: ${TEST_JSONL}"
+    echo "[INFO] Please run preprocess_baseline.py first"
     exit 1
 fi
+echo "[INFO] Test data found: ${TEST_JSONL}"
 
-# Check if adapter exists
-if [ ! -d "${ADAPTER_DIR}" ]; then
-    echo "[ERROR] Adapter directory not found: ${ADAPTER_DIR}"
-    echo "[INFO] Please run train_textgen_ragKG.sh first"
-    exit 1
+# Check if adapter exists (skip for base_model_only mode)
+if [ "$BASE_MODEL_ONLY" != true ]; then
+    if [ ! -d "${ADAPTER_DIR}" ]; then
+        echo "[ERROR] Adapter directory not found: ${ADAPTER_DIR}"
+        echo "[INFO] Please run train_textgen_baseline.sh first"
+        exit 1
+    fi
+    echo "[INFO] Adapter found: ${ADAPTER_DIR}"
 fi
 
 # Check if ICD index exists
@@ -230,21 +216,44 @@ if [ ! -d "${ICD_INDEX}" ]; then
     echo "[ERROR] ICD index directory not found: ${ICD_INDEX}"
     exit 1
 fi
+echo "[INFO] ICD index found: ${ICD_INDEX}"
+
+# Check if script exists
+if [ ! -f "${SCRIPT}" ]; then
+    echo "[ERROR] Testing script not found: ${SCRIPT}"
+    exit 1
+fi
+echo "[INFO] Testing script found: ${SCRIPT}"
+
+### ============================================================================
+### RUN TESTING
+### ============================================================================
+
+start=$(date +%s)
+echo ""
+echo "=========================================================================="
+echo "LAUNCHING TESTING"
+echo "=========================================================================="
+echo ""
 
 # Create output directories
 mkdir -p "$(dirname "${OUT_METRICS}")"
 mkdir -p "${TMP_DIR}"
 
-echo "[INFO] Launching testing..."
-echo ""
-
 export CUDA_VISIBLE_DEVICES=0
-export MODE=${MODE}
 
 CMD="python ${SCRIPT} \
   --test_jsonl \"${TEST_JSONL}\" \
-  --base_model \"${BASE_LLM}\" \
-  --adapter_dir \"${ADAPTER_DIR}\" \
+  --base_model \"${BASE_LLM}\""
+
+# Add adapter dir only if not in base_model_only mode
+if [ "$BASE_MODEL_ONLY" = true ]; then
+    CMD="${CMD} --base_model_only"
+else
+    CMD="${CMD} --adapter_dir \"${ADAPTER_DIR}\""
+fi
+
+CMD="${CMD} \
   --icd_index_dir \"${ICD_INDEX}\" \
   --encoder_model \"${ENCODER_MODEL}\" \
   --max_len 5120 \
@@ -272,7 +281,7 @@ if [ "$SUBSET_SIZE" -gt 0 ] 2>/dev/null; then
     CMD="${CMD} --subset_size ${SUBSET_SIZE} --subset_seed ${SUBSET_SEED}"
 fi
 
-if [[ "${USE_BF16}" == "1" ]]; then
+if [ "${USE_BF16}" = "1" ]; then
     CMD="${CMD} --use_bf16"
 fi
 
@@ -291,19 +300,23 @@ elapsed=$((end - start))
 minutes=$((elapsed / 60))
 seconds=$((elapsed % 60))
 
+### ============================================================================
+### SUMMARY
+### ============================================================================
+
 echo ""
 echo "=========================================================================="
-echo "[TIME] Testing completed"
+echo "TESTING SUMMARY"
+echo "=========================================================================="
 echo "[TIME] Elapsed: ${elapsed} seconds (${minutes}m ${seconds}s)"
 echo "[INFO] Exit code: ${status}"
 echo "[INFO] Job finished: $(date)"
-echo "=========================================================================="
+echo ""
 
 if [ $status -eq 0 ]; then
+    echo "[SUCCESS] Testing completed successfully"
     echo ""
-    echo " [SUCCESS] Testing completed successfully!"
-    echo ""
-    echo " Results saved to:"
+    echo "Results saved to:"
     echo "  Metrics: ${OUT_METRICS}"
     echo "  Buckets: $(dirname ${OUT_METRICS})/test_metrics_buckets.json"
     echo "  Per-label tables:"
@@ -314,12 +327,13 @@ if [ $status -eq 0 ]; then
     echo "  Shards:  ${TMP_DIR}"
     echo ""
 else
+    echo "[ERROR] Testing failed with exit code: ${status}"
     echo ""
-    echo " [ERROR] Testing failed with exit code: ${status}"
-    echo ""
-    echo " Check the log file for details:"
-    echo "   logs/Textgen-withKG-withRAG/test_textgen_rag_${SLURM_JOB_ID}.out"
+    echo "Check the log file for details:"
+    echo "  logs/Textgen/test_baseline_${SLURM_JOB_ID}.out"
     echo ""
 fi
+
+echo "=========================================================================="
 
 exit $status

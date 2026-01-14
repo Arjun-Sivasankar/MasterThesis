@@ -206,10 +206,6 @@ def build_textgen_prompt_budgeted(row: pd.Series, tok, max_len: int,
     kept_chars = best_mid
     return best_prompt, {"prompt_tokens": best_len, "notes_kept_chars": kept_chars, "notes_trimmed": len(notes_full)-kept_chars}
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df_cleaned = df.dropna(subset=TEXT_COLS_SAFE).copy()
-    return df_cleaned
-
 # ------------------ datasets ------------------
 class SFTTextGenDataset(Dataset):
     def __init__(self, df: pd.DataFrame, tokenizer,
@@ -602,9 +598,9 @@ def eval_pack(y_true, y_pred):
         "precision_macro": float(precision_score(y_true, y_pred, average='macro', zero_division=0)),
         "recall_macro":    float(recall_score(y_true, y_pred, average='macro', zero_division=0)),
         "f1_macro":        float(f1_score(y_true, y_pred, average='macro', zero_division=0)),
-        "precision_samples": float(precision_score(y_true, y_pred, average='samples', zero_division=0)),
-        "recall_samples":    float(recall_score(y_true, y_pred, average='samples', zero_division=0)),
-        "f1_samples":        float(f1_score(y_true, y_pred, average='samples', zero_division=0)),
+        # "precision_samples": float(precision_score(y_true, y_pred, average='samples', zero_division=0)),
+        # "recall_samples":    float(recall_score(y_true, y_pred, average='samples', zero_division=0)),
+        # "f1_samples":        float(f1_score(y_true, y_pred, average='samples', zero_division=0)),
     }
 
 def add_parent_macro_f1(metrics, gold_lists, pred_lists):

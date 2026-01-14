@@ -131,16 +131,76 @@ def get_icd9_parent(code: str) -> str:
         return base[:4] if len(base) >= 4 else base
     return code
 
-def serialize_structured_readable(row: pd.Series) -> str:
+def get_code_descriptions(kg, codes: List[str]) -> Dict[str, str]:
+    """
+    Get descriptions for given codes from the medical knowledge graph.
+    
+    Args:
+        kg: NetworkX DiGraph - the loaded medical knowledge graph
+        codes: List of codes to look up (e.g., ['45.76', '10.21'])
+    
+    Returns:
+        Dict mapping code -> description
+    """
+    code_to_desc = {}
+    
+    # Search through all nodes in the graph
+    for node, data in kg.nodes(data=True):
+        if 'code' in data:
+            node_code = str(data['code']).strip()
+            if node_code in codes:
+                description = data.get('name', 'No description available')
+                code_to_desc[node_code] = description
+    
+    return code_to_desc
+
+def load_knowledge_graph(kg_path: str) -> 'nx.DiGraph':
+    with open(kg_path, 'rb') as f:
+        kg = pickle.load(f)
+    return kg
+
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    df_cleaned = df.dropna(subset=TEXT_COLS_SAFE).copy()
+    return df_cleaned
+
+def serialize_structured_readable(row: pd.Series, map_desc: bool=False, kg=None) -> str:
     ndc  = " ".join(to_list(row.get("ndc", []))[:24])
     proc = " ".join(to_list(row.get("pro_code", []))[:24])
-    proc = [format_icd9_proc_from_pro(c) for c in proc if c]
-    labs = " ".join(to_list(row.get("lab_test", []))[:48])
+    proc = " ".join(c for c in (format_icd9_proc_from_pro(t) for t in to_list(proc)) if c)
+    labs = " ".join(to_list(row.get("lab_test_loinc", []))[:48])
+    
+    if map_desc and kg is not None:
+        # Map all codes to descriptions
+        ndc_map = get_code_descriptions(kg, ndc.split())
+        proc_map = get_code_descriptions(kg, proc.split())
+        labs_map = get_code_descriptions(kg, labs.split())
+        
+        # Get lists of descriptions that have mappings
+        ndc_descs = list(ndc_map.values())
+        proc_descs = list(proc_map.values())
+        labs_descs = list(labs_map.values())
+        
+        # Now you have both the mappings (dicts) and the description lists
+        # You can use them as needed in your serialization
+        
     parts=[]
     parts.append(f"DEMOGRAPHICS: gender={row.get('gender','')} age_group={row.get('age','')}")
-    if ndc:  parts.append(f"MEDICATIONS: {ndc}")
-    if proc: parts.append(f"PROCEDURES: {proc}")
-    if labs: parts.append(f"LAB TESTS: {labs}")
+    
+    if map_desc and kg is not None:
+        # Use descriptions instead of codes if available
+        if ndc_descs:  parts.append(f"MEDICATIONS: {' | '.join(ndc_descs)}")
+        elif ndc: parts.append(f"MEDICATIONS: {ndc}")
+        
+        if proc_descs: parts.append(f"PROCEDURES: {' | '.join(proc_descs)}")
+        elif proc: parts.append(f"PROCEDURES: {proc}")
+        
+        if labs_descs: parts.append(f"LAB TESTS: {' | '.join(labs_descs)}")
+        elif labs: parts.append(f"LAB TESTS: {labs}")
+    else:
+        if ndc:  parts.append(f"MEDICATIONS: {ndc}")
+        if proc: parts.append(f"PROCEDURES: {proc}")
+        if labs: parts.append(f"LAB TESTS: {labs}")
+    
     return "\n".join(parts)
 
 def serialize_notes(row: pd.Series) -> str:
@@ -159,11 +219,12 @@ def chat_token_len(tok, msgs: List[Dict], add_generation_prompt: bool) -> int:
     return token_len(tok, txt)
 
 def build_textgen_prompt_budgeted(row: pd.Series, tok, max_len: int,
-                                  min_assist_tokens: int, N_max_terms: int
+                                  min_assist_tokens: int, N_max_terms: int,
+                                  map_desc: bool=False, kg=None
                                   ) -> Tuple[str, Dict[str, int]]:
     head = []
     head.append(f"[VISIT] subject_id={row.get('subject_id_x','?')} hadm_id={row.get('hadm_id','?')}")
-    head.append(serialize_structured_readable(row))
+    head.append(serialize_structured_readable(row, map_desc=map_desc, kg=kg))
     notes_full = serialize_notes(row)
 
     tail = [
@@ -206,10 +267,6 @@ def build_textgen_prompt_budgeted(row: pd.Series, tok, max_len: int,
     kept_chars = best_mid
     return best_prompt, {"prompt_tokens": best_len, "notes_kept_chars": kept_chars, "notes_trimmed": len(notes_full)-kept_chars}
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df_cleaned = df.dropna(subset=TEXT_COLS_SAFE).copy()
-    return df_cleaned
-
 # ------------------ datasets ------------------
 class SFTTextGenDataset(Dataset):
     def __init__(self, df: pd.DataFrame, tokenizer,
@@ -218,13 +275,17 @@ class SFTTextGenDataset(Dataset):
                  icd_index_dir: str,
                  max_len: int,
                  N_max_terms: int,
-                 min_assistant_tokens: int):
+                 min_assistant_tokens: int,
+                 map_desc: bool=False,
+                 kg=None):
         self.tok = tokenizer
         self.label_col = label_col
         self.target_mode = target_mode
         self.max_len = max_len
         self.N_max_terms = N_max_terms
         self.min_assistant_tokens = max(1, int(min_assistant_tokens))
+        self.map_desc = map_desc
+        self.kg = kg
 
         self.code2title = {}
         if target_mode == "icd_titles":
@@ -264,7 +325,8 @@ class SFTTextGenDataset(Dataset):
                 continue
 
             prompt, stat = build_textgen_prompt_budgeted(
-                row, self.tok, self.max_len, self.min_assistant_tokens, self.N_max_terms
+                row, self.tok, self.max_len, self.min_assistant_tokens, self.N_max_terms,
+                map_desc=self.map_desc, kg=self.kg
             )
             if stat.get("notes_trimmed", 0) > 0:
                 trimmed_notes += 1

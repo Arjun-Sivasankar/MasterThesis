@@ -1,658 +1,909 @@
-import pandas as pd
-import networkx as nx
-from tqdm import tqdm
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Combined UMLS code2cui mapping builder and comprehensive KG constructor.
+
+This script:
+1. Builds code->CUI maps from UMLS MRCONSO.RRF for ATC, LOINC, SNOMEDCT_US
+2. Loads ICD-9 DX/PROC mappings from specific pickle files and JSON
+3. Creates alias mappings for ICD-9 codes
+4. Builds a comprehensive medical knowledge graph ensuring all codes have CUI mappings
+5. Creates clean, non-aggregated SAB fields with only target vocabularies
+6. Creates separate edge rows for each vocabulary combination
+
+Outputs:
+- code2cui_*.pkl files for each vocabulary
+- alias2canon_*.pkl files for ICD-9
+- Knowledge graph files (nodes.csv, edges.csv, .graphml, .pkl)
+- Statistics and visualizations
+"""
+
 import os
-
-# Paths to RRF files (customize)
-# Update paths to match your actual directory structure
-MRCONSO = '/data/horse/ws/arsi805e-finetune/Thesis/UMLS/2025AA/META/MRCONSO.RRF'
-MRREL = '/data/horse/ws/arsi805e-finetune/Thesis/UMLS/2025AA/META/MRREL.RRF'
-MRSTY = '/data/horse/ws/arsi805e-finetune/Thesis/UMLS/2025AA/META/MRSTY.RRF'
-
-DATA_DIR = 'KG/data_files'
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# 1. Load UMLS Concept Names
-def load_mrconso(path, langs=['ENG']):
-    # See UMLS documentation for column order!
-    columns = [
-        'CUI', 'LAT', 'TS', 'LUI', 'STT', 'SUI', 'ISPREF', 'AUI',
-        'SAUI', 'SCUI', 'SDUI', 'SAB', 'TTY', 'CODE', 'STR', 'SRL', 'SUPPRESS', 'CVF'
-    ]
-    df = pd.read_csv(path, sep='|', names=columns, dtype=str, index_col=False)
-    df = df[df['LAT'].isin(langs)]
-    return df
-
-# 2. Load UMLS Relationships
-def load_mrrel(path):
-    columns = [
-        'CUI1', 'AUI1', 'STYPE1', 'REL', 'CUI2', 'AUI2', 'STYPE2', 'RELA', 'RUI', 'SRUI',
-        'SAB', 'SL', 'RG', 'DIR', 'SUPPRESS', 'CVF'
-    ]
-    return pd.read_csv(path, sep='|', names=columns, dtype=str, index_col=False)
-
-print("Loading CONSO..." )
-conso = load_mrconso(MRCONSO)
-print("Loaded CONSO file.....")
-
-print("Loading REL..." )
-rel = load_mrrel(MRREL)
-print("Loaded REL file.....")
-
-print(rel.head())
-print(rel.shape)
-print(rel.info())
-
-## Vocabs in UMLS relationships:
-print("Vocabularies in UMLS relationships:")
-print(rel.SAB.unique())
-
-## conso info:
-print("CONSO info:")
-print(conso.info())
-print(conso.head())
-print(conso.shape)
-
-## SNOMED in conso:
-print("SNOMED in CONSO:")
-print(conso[conso.SAB=='SNOMEDCT_US'])
-
-## -----------------------------------------
-## ICD-10-CM:
-icd10_concept_df = conso[
-    (conso["TS"] == "P") &
-    (conso["SAB"] == "ICD10CM") &
-    (conso["SUPPRESS"] != "O")
-]
-
-print(f"ICD-10-CM concepts: {icd10_concept_df.shape[0]}")
-print(icd10_concept_df.head())
-
-# Concepts that map to ranges of ICD10CM codes are often too broad and are omitted
-icd10_concept_df = icd10_concept_df.loc[~icd10_concept_df['CODE'].str.contains('-')]
-
-# only keep codes with 6 or less characters (two places after decimal point)
-icd10_concept_df = icd10_concept_df.assign(len_icd=icd10_concept_df['CODE'].apply(lambda x: len(x)))
-icd10_concept_df = icd10_concept_df.loc[icd10_concept_df['len_icd'] <= 6+1] # 7 bc of decimal points
-
-n = len(icd10_concept_df)
-print("Number of rows in ICD10CM concept df: %d" % n)
-
-n = len(icd10_concept_df['CUI'].unique())
-print("Number of CUI in ICD10CM concept df: %d" % n)
-
-n = len(icd10_concept_df['CODE'].unique())
-print("Number of codes in ICD10CM concept df: %d" % n)
-
-print(icd10_concept_df.head())
-print("-"*50)
-
-## ICD-9-CM:
-icd9_concept_df = conso[
-    (conso["TS"] == "P") &
-    (conso["SAB"] == "ICD9CM") &
-    (conso["SUPPRESS"] != "O")
-]
-
-print(f"ICD-9-CM concepts: {icd9_concept_df.shape[0]}")
-print(icd9_concept_df.head())
-
-icd9_concept_df = icd9_concept_df.loc[~icd9_concept_df['CODE'].str.contains('-')]
-
-# remove ICDs < 1 (procedures)
-icd9_concept_df = icd9_concept_df.loc[~icd9_concept_df['CODE'].str.startswith('00.')]
-
-n = len(icd9_concept_df)
-print("Number of rows in ICD10CM concept df: %d" % n)
-
-n = len(icd9_concept_df['CUI'].unique())
-print("Number of CUI in ICD10CM concept df: %d" % n)
-
-n = len(icd9_concept_df['CODE'].unique())
-print("Number of codes in ICD10CM concept df: %d" % n)
-
-print(icd9_concept_df.head())
-print("-"*50)
-
-## SNOMED:
-snomed_concept_df = conso[
-    (conso["TS"] == "P") &
-    (conso["SAB"] == "SNOMEDCT_US") &
-    (conso["SUPPRESS"] != "O")
-]
-
-print(f"SNOMED concepts before filtering: {snomed_concept_df.shape[0]}")
-
-# Import SNOMED Core Subset and KP List for filtering SNOMED concepts
-try:
-    core_df = pd.read_csv("/data/horse/ws/arsi805e-finetune/Thesis/SNOMEDCT_CORE_SUBSET_202506.txt", sep='|')
-    core_df = core_df.loc[core_df['SNOMED_CONCEPT_STATUS'] == 'Current']
-    core_df = core_df.assign(SNOMED_CID=core_df['SNOMED_CID'].astype(str))
-    
-    kp_df = pd.read_csv("/data/horse/ws/arsi805e-finetune/Thesis/KPList.txt", sep='\t', encoding='latin-1')
-    kp_df['SCTID'] = kp_df['SCTID'].astype(str)
-    
-    # Filter SNOMED concepts by core subset and KP list
-    snomed_concept_df = snomed_concept_df.loc[snomed_concept_df['CODE'].isin(
-        core_df['SNOMED_CID'].tolist() + kp_df['SCTID'].tolist())]
-    
-    print(f"SNOMED concepts after filtering: {snomed_concept_df.shape[0]}")
-except Exception as e:
-    print(f"Warning: Could not filter SNOMED concepts using core subset and KP list: {e}")
-    print("Using all SNOMED concepts instead.")
-
-n = len(snomed_concept_df)
-print("Number of rows in SNOMED concept df: %d" % n)
-
-n = len(snomed_concept_df['CUI'].unique())
-print("Number of CUI in SNOMED concept df: %d" % n)
-
-n = len(snomed_concept_df['CODE'].unique())
-print("Number of codes in SNOMED concept df: %d" % n)
-
-print(snomed_concept_df.head())
-print("-"*50)
-
-## ATC (Anatomical Therapeutic Chemical Classification):
-atc_concept_df = conso[
-    (conso["TS"] == "P") &
-    (conso["SAB"] == "ATC") &
-    (conso["SUPPRESS"] != "O")
-]
-
-print(f"ATC concepts before filtering: {atc_concept_df.shape[0]}")
-
-# Only keep ATC4 and ATC5 levels (medication classes and specific drugs)
-atc_concept_df = atc_concept_df.assign(len_atc=atc_concept_df['CODE'].apply(len))
-atc_concept_df = atc_concept_df.loc[atc_concept_df['len_atc'] >= 4]
-
-n = len(atc_concept_df)
-print("Number of rows in ATC concept df: %d" % n)
-
-n = len(atc_concept_df['CUI'].unique())
-print("Number of CUI in ATC concept df: %d" % n)
-
-n = len(atc_concept_df['CODE'].unique())
-print("Number of codes in ATC concept df: %d" % n)
-
-print(atc_concept_df.head())
-print("-"*50)
-
-## LOINC (Laboratory tests):
-lnc_concept_df = conso[
-    (conso["TS"] == "P") &
-    (conso["SAB"] == "LNC") &
-    (conso["SUPPRESS"] != "O")
-]
-
-print(f"LOINC concepts before filtering: {lnc_concept_df.shape[0]}")
-
-# Try to filter by LOINC parts
-try:
-    loinc_part_df = pd.read_csv("/data/horse/ws/arsi805e-finetune/Thesis/Part.csv")
-    loinc_part_df = loinc_part_df.loc[loinc_part_df['Status'] == 'ACTIVE']
-    
-    n = len(loinc_part_df)
-    print("Number of LOINC parts before filtering by part name: %d" % n)
-    
-    # Filter out less useful part types
-    loinc_part_df = loinc_part_df.loc[~loinc_part_df['PartTypeName'].isin([
-        'ADJUSTMENT', 'CHALLENGE', 'COUNT', 'PROPERTY', 'SCALE', 'SUPER SYSTEM', 'TIME', 'TIME MODIFIER'])]
-    
-    n = len(loinc_part_df)
-    print("Number of LOINC parts after filtering: %d" % n)
-    
-    # Filter concept df by loinc part numbers
-    lnc_concept_df = lnc_concept_df.loc[lnc_concept_df['CODE'].isin(loinc_part_df['PartNumber'])]
-except Exception as e:
-    print(f"Warning: Could not filter LOINC concepts using parts file: {e}")
-    print("Using all LOINC concepts instead.")
-
-# Try to add LOINC codes from MIMIC data
-try:
-    import pickle
-    with open('mimic.pkl', 'rb') as f:
-        mimic = pickle.load(f)
-    
-    # Pool all LOINC codes into one flat set
-    all_loinc = set()
-    for loinc_list in mimic['lab_test_loinc']:
-        all_loinc.update(loinc_list)
-    
-    if 'nan' in all_loinc:
-        all_loinc.remove('nan')
-        
-    print(f"Unique LOINC codes in MIMIC data: {len(all_loinc)}")
-    
-    # Map LOINC codes to CUIs
-    conso_lnc = conso[conso['SAB'] == 'LNC']
-    loinc_to_cui = {}
-    for code in all_loinc:
-        row = conso_lnc[conso_lnc['CODE'] == code]
-        if not row.empty:
-            cui = row.iloc[0]['CUI']
-            loinc_to_cui[code] = cui
-        else:
-            loinc_to_cui[code] = None
-            
-    valid_lab_cuis = set(cui for cui in loinc_to_cui.values() if cui is not None)
-    print(f"Total valid lab CUIs mapped from MIMIC: {len(valid_lab_cuis)}")
-    
-    # Add these concepts
-    extra_conso_lnc = conso_lnc[conso_lnc['CUI'].isin(valid_lab_cuis)]
-    merged_lnc_concept = pd.concat([lnc_concept_df, extra_conso_lnc], ignore_index=True)
-    merged_lnc_concept = merged_lnc_concept.drop_duplicates(subset=['CUI', 'CODE'])
-    lnc_concept_df = merged_lnc_concept
-except Exception as e:
-    print(f"Warning: Could not add MIMIC LOINC concepts: {e}")
-
-n = len(lnc_concept_df)
-print("Number of rows in LOINC concept df: %d" % n)
-
-n = len(lnc_concept_df['CUI'].unique())
-print("Number of CUI in LOINC concept df: %d" % n)
-
-n = len(lnc_concept_df['CODE'].unique())
-print("Number of codes in LOINC concept df: %d" % n)
-
-print(lnc_concept_df.head())
-print("-"*50)
-
-## CPT (Current Procedural Terminology):
-cpt_concept_df = conso[
-    (conso["TS"] == "P") &
-    (conso["SAB"] == "CPT") &
-    (conso["SUPPRESS"] != "O")
-]
-
-print(f"CPT concepts before filtering: {cpt_concept_df.shape[0]}")
-
-# Category I only: 00100–99499 (main procedure codes)
-cpt_concept_df['CODE_INT'] = pd.to_numeric(cpt_concept_df['CODE'], errors='coerce')
-cpt_concept_df = cpt_concept_df.loc[cpt_concept_df['CODE_INT'].between(100, 99499)]
-
-# There are many CUIs mapped to individual CPT codes due to many detailed atoms
-# To reduce excessive redundancies, we limit to only the preferred term ('PT')
-cpt_concept_df = cpt_concept_df.loc[cpt_concept_df['TTY'] == 'PT']
-
-n = len(cpt_concept_df)
-print("Number of rows in CPT concept df: %d" % n)
-
-n = len(cpt_concept_df['CUI'].unique())
-print("Number of CUI in CPT concept df: %d" % n)
-
-n = len(cpt_concept_df['CODE'].unique())
-print("Number of codes in CPT concept df: %d" % n)
-
-print(cpt_concept_df.head())
-print("-"*50)
-
-## ICD10PCS (Procedure Coding System):
-icd10pcs_concept_df = conso[
-    (conso["TS"] == "P") &
-    (conso["SAB"] == "ICD10PCS") &
-    (conso["SUPPRESS"] != "O")
-]
-
-print(f"ICD10PCS concepts before filtering: {icd10pcs_concept_df.shape[0]}")
-
-# Try to filter using ICD9-to-ICD10PCS mapping
-try:
-    icd9_icd10_map = pd.read_csv('icd9toicd10pcsgem.csv')
-    icd10pcs_codes = icd9_icd10_map['icd10cm'].unique()
-    print(f'No. of unique ICD10PCS codes in map: {len(icd10pcs_codes)}')
-    
-    icd10pcs_concept_df = icd10pcs_concept_df[icd10pcs_concept_df['CODE'].isin(icd10pcs_codes)]
-    icd10pcs_concept_df = icd10pcs_concept_df.drop_duplicates(subset=['CUI', 'CODE', 'STR'])
-except Exception as e:
-    print(f"Warning: Could not filter ICD10PCS concepts using mapping: {e}")
-    print("Using all ICD10PCS concepts instead.")
-
-n = len(icd10pcs_concept_df)
-print("Number of rows in ICD10PCS concept df: %d" % n)
-
-n = len(icd10pcs_concept_df['CUI'].unique())
-print("Number of CUI in ICD10PCS concept df: %d" % n)
-
-n = len(icd10pcs_concept_df['CODE'].unique())
-print("Number of codes in ICD10PCS concept df: %d" % n)
-
-print(icd10pcs_concept_df.head())
-print("-"*50)
-
-# Combine all CUIs from your vocabularies
-all_cuis = set(icd9_concept_df['CUI']).union(
-    icd10_concept_df['CUI']).union(
-    snomed_concept_df['CUI']).union(
-    atc_concept_df['CUI']).union(
-    lnc_concept_df['CUI']).union(
-    cpt_concept_df['CUI']).union(
-    icd10pcs_concept_df['CUI'])
-
-print("Total unique CUIs across all vocabularies: ", len(all_cuis))
-
-# Create a combined concept dataframe
-concept_df = pd.concat([
-    icd9_concept_df, 
-    icd10_concept_df, 
-    snomed_concept_df, 
-    lnc_concept_df, 
-    atc_concept_df, 
-    cpt_concept_df, 
-    icd10pcs_concept_df
-])
-
-print("Combined concept dataframe shape: ", concept_df.shape)
-
-# Filter relationships to include only those between our concepts
-rel_edges = rel[(rel['CUI1'].isin(all_cuis)) & (rel['CUI2'].isin(all_cuis))]
-print("Relationship edges after filtering by CUIs: ", rel_edges.shape)
-
-# Further filter by source vocabularies
-sab_vocabs = ['CPT', 'LNC', 'ATC', 'SNOMEDCT_US', 'ICD10CM', 'ICD9CM', 'ICD10PCS']
-rel_edges = rel_edges[rel_edges['SAB'].isin(sab_vocabs)]
-print("Relationship edges after filtering by vocabularies: ", rel_edges.shape)
-
-# Create node dataframe for KG
-atom_df = concept_df[['CUI', 'SAB', 'CODE', 'STR']].drop_duplicates()
-print("Atom dataframe shape: ", atom_df.shape)
-
-# Check for duplicates and save nodes
-print("Node counts by vocabulary type:")
-print(atom_df[['SAB', 'CODE']].groupby('SAB').count())
-
-atom_df.to_csv(f"{DATA_DIR}/nodes_kg.csv", sep='\t', index=False)
-
-# Create nodes with unique IDs
-nodes = atom_df.copy()
-nodes['node_id'] = nodes['CODE'] + ':' + nodes['SAB'].str.lower()
-nodes['node_name'] = nodes['STR'].copy()
-nodes['ntype'] = nodes['SAB'].copy()
-nodes = nodes[['node_id', 'node_name', 'ntype', 'CUI']]
-nodes['old_node_id'] = nodes['node_id'].str.split(':', expand=True)[0]
-nodes = nodes.reset_index().drop(['index'], axis=1)
-nodes['node_index'] = nodes.index
-
-# Function to create relationship edges for each vocabulary
-def make_kg_edges_for_vocab(vocab, rel_edges, concept_df, atom_df, wanted_rels):
-    edges = rel_edges[
-        (rel_edges['SAB'] == vocab) &
-        (rel_edges['RELA'].isin(wanted_rels))
-    ]
-    
-    edges = edges.merge(
-        concept_df[['CUI', 'CODE', 'STR', 'SAB']],
-        left_on='CUI1', right_on='CUI', how='left'
-    ).rename(
-        columns={'CODE': 'CODE_1', 'STR': 'STR_1', 'SAB': 'SAB_1'}
-    ).drop('CUI', axis=1)
-    
-    edges = edges.merge(
-        concept_df[['CUI', 'CODE', 'STR', 'SAB']],
-        left_on='CUI2', right_on='CUI', how='left'
-    ).rename(
-        columns={'CODE': 'CODE_2', 'STR': 'STR_2', 'SAB': 'SAB_2'}
-    ).drop('CUI', axis=1)
-    
-    edges = edges[edges['CODE_1'] != edges['CODE_2']].drop_duplicates()
-    
-    edges = edges.merge(atom_df[['CUI', 'CODE', 'STR', 'SAB']], left_on='CUI1', right_on='CUI', how='left')
-    
-    edges = edges.rename(columns={
-        'CODE': 'CODE_1',
-        'STR': 'STR_1',
-        'SAB_y': 'SAB_1'
-    })
-    
-    edges = edges[[
-        'CODE_1', 'STR_1', 'CUI1', 'SAB_1', 'RELA', 'CODE_2', 'STR_2', 'CUI2', 'SAB_2'
-    ]]
-    edges = edges.loc[:, ~edges.columns.duplicated()]
-    edges.columns = [
-        'node_id_x', 'node_name_x', 'CUI_x','ntype_x',
-        'relationship',
-        'node_id_y', 'node_name_y', 'CUI_y', 'ntype_y'
-    ]
-    
-    return edges
-
-# Define relationships to keep for each vocabulary
-vocab_relations = {
-    'ATC': ['isa', 'member_of', 'member-of'],
-    'CPT': ['associated_procedure_of', 'has_associated_procedure', 'has_procedure_site', 
-            'procedure_site_of', 'has_pathology', 'pathology_of', 'add_on_code_for', 
-            'has_add_on_code'],
-    'LNC': ['has_expanded_form', 'expanded_form_of', 'mth_has_expanded_form', 'mth_expanded_form_of'],
-    'SNOMEDCT_US': ['cause_of', 'due_to', 'definitional_manifestation_of', 
-                    'has_definitional_manifestation', 'occurs_after', 
-                    'occurs_before', 'occurs_in', 'associated_with'],
-    'ICD10PCS': ['expanded_form_of', 'has_expanded_form'],
-    'ICD9CM': ['has_finding_site', 'finding_site_of'],
-    'ICD10CM': ['has_finding_site', 'finding_site_of']
-}
-
-# Create edges for each vocabulary
-edge_dfs = []
-for vocab, rels in vocab_relations.items():
-    print(f"Creating edges for {vocab}...")
-    edges = make_kg_edges_for_vocab(vocab, rel_edges, concept_df, atom_df, rels)
-    edges['node_id_x'] = edges['node_id_x'] + ':' + edges['ntype_x'].str.lower()
-    edges['node_id_y'] = edges['node_id_y'] + ':' + edges['ntype_y'].str.lower()
-    edge_dfs.append(edges)
-    print(f"Created {len(edges)} edges for {vocab}")
-
-# Try to add SNOMED-ICD10CM mappings
-try:
-    print("Adding SNOMED to ICD10CM mappings...")
-    snomed_map_df = pd.read_csv("/data/horse/ws/arsi805e-finetune/Thesis/SNOMED/subset_SNOMED/Refset/Map/der2_iisssccRefset_ExtendedMapSnapshot_INT_20250401.txt", sep='\t')
-    snomed_map_df['referencedComponentId'] = snomed_map_df['referencedComponentId'].astype(str)
-    snomed_map_df['mapTarget'] = snomed_map_df['mapTarget'].astype(str)
-
-    snomed_map_df = snomed_map_df.loc[(snomed_map_df['referencedComponentId'].isin(nodes.loc[nodes['ntype'] == 'SNOMEDCT_US']['old_node_id'].tolist())) & 
-                      (snomed_map_df['mapTarget'].isin(nodes.loc[nodes['ntype']=='ICD10CM']['old_node_id'].tolist()))]
-
-    snomed_map_df = snomed_map_df.loc[(snomed_map_df['active'] == 1)]
-
-    snomed_map_df = snomed_map_df[['referencedComponentId', 'mapTarget']]
-    snomed_map_df.columns = ['node_id_x', 'node_id_y']
-    snomed_map_df = snomed_map_df.assign(relationship='snomed_icd')
-    snomed_map_df = snomed_map_df.assign(ntype_x='SNOMEDCT_US')
-    snomed_map_df = snomed_map_df.assign(ntype_y='ICD10CM')
-
-    snomed_map_df = snomed_map_df.merge(snomed_concept_df[['CODE', 'STR']], left_on='node_id_x', right_on='CODE').drop(['CODE'], axis=1)
-    snomed_map_df = snomed_map_df.merge(icd10_concept_df[['CODE', 'STR']], left_on='node_id_y', right_on='CODE').drop(['CODE'], axis=1)
-
-    snomed_map_df['node_id_x'] = snomed_map_df['node_id_x'] + ':' + 'snomedct_us'
-    snomed_map_df['node_id_y'] = snomed_map_df['node_id_y'] + ':' + 'icd10cm'
-    snomed_map_df.columns = ['node_id_x', 'node_id_y', 'relationship', 'ntype_x', 'ntype_y', 'node_name_x', 'node_name_y']
-    
-    edge_dfs.append(snomed_map_df)
-    print(f"Added {len(snomed_map_df)} SNOMED-ICD10CM edges")
-except Exception as e:
-    print(f"Warning: Could not add SNOMED to ICD10CM mappings: {e}")
-
-# Try to add ATC4-ATC5 edges
-try:
-    print("Adding ATC4-ATC5 mappings...")
-    atc5_df = atc_concept_df.loc[atc_concept_df['len_atc'] == 7]
-    atc4_df = atc_concept_df.loc[atc_concept_df['len_atc'] == 5]
-
-    atc_rows = []
-    for i, parent_atc in atc4_df.iterrows():
-        atc = parent_atc['CODE']
-        name = parent_atc['STR']
-        cui = parent_atc['CUI']
-        df = atc5_df.loc[atc5_df['CODE'].str.startswith(atc)][['CODE', 'STR', 'SAB', 'CUI']]
-        df.columns = ['node_id_y', 'node_name_y', 'ntype_y', 'CUI_y']
-        df = df.assign(node_id_x=[atc]*len(df))
-        df = df.assign(node_name_x=[name]*len(df))
-        df = df.assign(ntype_x=['ATC']*len(df))
-        df = df.assign(CUI_x=[cui]*len(df))
-        atc_rows.append(df)
-
-    if atc_rows:
-        atc45_relation_df = pd.concat(atc_rows)
-        atc45_relation_df['relationship'] = 'has_drug'
-        atc45_relation_df['node_id_x'] = atc45_relation_df['node_id_x'] + ':atc'
-        atc45_relation_df['node_id_y'] = atc45_relation_df['node_id_y'] + ':atc'
-        edge_dfs.append(atc45_relation_df)
-        print(f"Added {len(atc45_relation_df)} ATC4-ATC5 edges")
-except Exception as e:
-    print(f"Warning: Could not add ATC4-ATC5 mappings: {e}")
-
-# Function to standardize edge columns
-def standardize_edge_columns(df):
-    """
-    Ensure the DataFrame columns are in the canonical order for KG edges.
-    Missing columns are added with None values.
-    """
-    canonical_cols = [
-        'node_id_x', 'node_name_x', 'CUI_x', 'ntype_x',
-        'relationship',
-        'node_id_y', 'node_name_y', 'CUI_y', 'ntype_y'
-    ]
-    for col in canonical_cols:
-        if col not in df.columns:
-            df[col] = None
-    return df[canonical_cols]
-
-# Standardize and combine all edge dataframes
-print("Combining edge dataframes...")
-edge_dfs = [standardize_edge_columns(df).loc[:, ~df.columns.duplicated()] for df in edge_dfs]
-edge_df = pd.concat(edge_dfs, ignore_index=True)
-print(f"Combined {len(edge_df)} edges from all vocabularies")
-
-# Create bidirectional edges
-print("Creating bidirectional edges...")
-edge_x_list = edge_df['node_id_x'].tolist() + edge_df['node_id_y'].tolist()
-edge_y_list = edge_df['node_id_y'].tolist() + edge_df['node_id_x'].tolist()
-edge_relationship_list = edge_df['relationship'].tolist() + edge_df['relationship'].tolist()
-edge_CUI_x = edge_df['CUI_x'].tolist() + edge_df['CUI_y'].tolist()
-edge_CUI_y = edge_df['CUI_y'].tolist() + edge_df['CUI_x'].tolist()
-edge_ntype_x_list = edge_df['ntype_x'].tolist() + edge_df['ntype_y'].tolist()
-edge_ntype_y_list = edge_df['ntype_y'].tolist() + edge_df['ntype_x'].tolist()
-
-new_edge_df = pd.DataFrame({
-    'node_id_x': edge_x_list, 
-    'CUI_x': edge_CUI_x, 
-    'ntype_x': edge_ntype_x_list,
-    'relationship': edge_relationship_list,
-    'node_id_y': edge_y_list, 
-    'CUI_y': edge_CUI_y,
-    'ntype_y': edge_ntype_y_list
-}).drop_duplicates(['node_id_x', 'relationship', 'node_id_y'])
-
-print(f"Final edge dataframe shape after bidirectionalization: {new_edge_df.shape}")
-
-# Standardize node IDs format
-for col in ['node_id_x', 'node_id_y']:
-    new_edge_df[col] = new_edge_df[col].str.replace(
-        r':([A-Za-z0-9]+)$',
-        lambda m: ':' + m.group(1).lower(),
-        regex=True
-    )
-
-# Remove edges with null relationships
-new_edge_df.dropna(subset=['relationship'], inplace=True)
-print(f"Final edge dataframe shape after removing null relationships: {new_edge_df.shape}")
-
-# Save edges
-new_edge_df.to_csv(f"{DATA_DIR}/edges.csv", sep='\t', index=False)
-
-# Create combined edges with node indices
-valid_nodes = set(nodes['node_id'])
-df = new_edge_df[new_edge_df['node_id_x'].isin(valid_nodes) & new_edge_df['node_id_y'].isin(valid_nodes)]
-
-combined_edge_df = df.merge(nodes[['node_id', 'node_index']], left_on='node_id_x', right_on='node_id').drop(['node_id'], axis=1)
-combined_edge_df = combined_edge_df.merge(nodes[['node_id', 'node_index']], left_on='node_id_y', right_on='node_id').drop(['node_id'], axis=1)
-combined_edge_df.dropna(subset=['relationship'], inplace=True)
-
-# Save final edge data with node indices
-combined_edge_df = combined_edge_df.reset_index().drop(['index'], axis=1)
-combined_edge_df = combined_edge_df.assign(edge_index=combined_edge_df.index)
-combined_edge_df.to_csv(f"{DATA_DIR}/edge_kg.csv", sep='\t', index=False)
-
-# Generate adjacency list for network analysis
-combined_edge_df[['node_index_x', 'node_index_y']].to_csv(f"{DATA_DIR}/adj_list.csv", sep=' ', index=False, header=False)
-
-print("Building NetworkX graph...")
-# Create a NetworkX graph representation
-G = nx.MultiDiGraph()  # Directed graph with possible multiple edges
-
-# Add nodes
-for _, row in tqdm(nodes.iterrows(), total=len(nodes), desc="Adding nodes"):
-    G.add_node(
-        row['node_id'],
-        node_name=row['node_name'],
-        ntype=row['ntype'],
-        CUI=row['CUI'],
-        old_node_id=row['old_node_id'],
-        node_index=row['node_index']
-    )
-
-# Add edges
-for _, row in tqdm(df.iterrows(), total=len(df), desc="Adding edges"):
-    G.add_edge(
-        row['node_id_x'],
-        row['node_id_y'],
-        relationship=row['relationship'],
-        CUI_x=row['CUI_x'],
-        ntype_x=row['ntype_x'],
-        CUI_y=row['CUI_y'],
-        ntype_y=row['ntype_y']
-    )
-
-# Find largest connected component for a more usable graph
-print("Finding largest connected component...")
-largest_cc = max(nx.weakly_connected_components(G), key=len)
-G_connected = G.subgraph(largest_cc).copy()
-
-print(f"Original graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-print(f"Largest component: {G_connected.number_of_nodes()} nodes, {G_connected.number_of_edges()} edges")
-
-# Build lookup dictionaries for easier access
-print("Building lookup dictionaries...")
-
-def build_lookups(conso_df):
-    # CODE → CUI
-    code2cui = pd.Series(conso_df['CUI'].values, index=conso_df['CODE']).to_dict()
-    # CUI → list of codes
-    cui2codes = conso_df.groupby('CUI')['CODE'].apply(list).to_dict()
-    # CUI → list of strings
-    cui2strs = conso_df.groupby('CUI')['STR'].apply(list).to_dict()
-    # CUI → list of SABs
-    cui2sabs = conso_df.groupby('CUI')['SAB'].apply(list).to_dict()
-    # CUI → all codes+vocab+desc
-    cui2records = conso_df.groupby('CUI').apply(lambda g: g[['CODE','SAB','STR']].to_dict('records')).to_dict()
-    return code2cui, cui2codes, cui2strs, cui2sabs, cui2records
-
-# Build lookups
-code2cui, cui2codes, cui2strs, cui2sabs, cui2records = build_lookups(concept_df)
-
-# Save the graph and lookup data
+import re
+import json
 import pickle
-print("Saving graph and lookups...")
+import argparse
+import csv
+from collections import defaultdict
+from datetime import datetime
+from typing import Dict, Iterable, Tuple, List, Set, Any
+from itertools import product
 
-with open(f"{DATA_DIR}/clinical_kg_networkx.pkl", "wb") as f:
-    pickle.dump(G, f)
-print(f"Saved full KG graph to {DATA_DIR}/clinical_kg_networkx.pkl")
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import networkx as nx
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-with open(f"{DATA_DIR}/clinical_kg_connected_networkx.pkl", "wb") as f:
-    pickle.dump(G_connected, f)
-print(f"Saved connected component KG graph to {DATA_DIR}/clinical_kg_connected_networkx.pkl")
+# -------------------- Configuration --------------------
+UMLS_DIR = '/data/horse/ws/arsi805e-finetune/Thesis/UMLS/2025AA/META'
+OUTPUT_DIR = '/data/horse/ws/arsi805e-finetune/Thesis/MasterThesis/KG/kg_output3'
+TARGET_VOCABS = ['ICD9CM', 'LNC', 'ATC', 'SNOMEDCT_US']
 
-with open(f"{DATA_DIR}/kg_lookups.pkl", "wb") as f:
-    pickle.dump({
-        'code2cui': code2cui,
-        'cui2codes': cui2codes, 
-        'cui2strs': cui2strs,
-        'cui2sabs': cui2sabs,
-        'cui2records': cui2records
-    }, f)
-print(f"Saved lookup dictionaries to {DATA_DIR}/kg_lookups.pkl")
+# MRCONSO columns
+COLS = [
+    'CUI', 'LAT', 'TS', 'LUI', 'STT', 'SUI', 'ISPREF', 'AUI', 'SAUI', 'SCUI', 'SDUI',
+    'SAB', 'TTY', 'CODE', 'STR', 'SRL', 'SUPPRESS', 'CVF'
+]
+USECOLS_MIN = ['CUI', 'LAT', 'TS', 'SAB', 'TTY', 'CODE', 'STR', 'SUPPRESS']
+USECOLS_IDX = [0, 1, 2, 11, 12, 13, 14, 16]
 
-print("Knowledge Graph building complete!")
-print(f"Nodes: {G.number_of_nodes()}, Edges: {G.number_of_edges()}")
-print(f"Connected component: {G_connected.number_of_nodes()} nodes, {G_connected.number_of_edges()} edges")
+# -------------------- Utility Functions --------------------
+def ensure_dir(p: str):
+    os.makedirs(p, exist_ok=True)
 
-print("Done.....")
+def make_logger(out_dir: str):
+    ensure_dir(out_dir)
+    log_file = os.path.join(out_dir, f'kg_build_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+    
+    def _log(msg: str):
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(log_file, 'a') as f:
+            f.write(f'[{ts}] {msg}\n')
+        print(msg)
+    return _log
+
+def dump_pickle(path: str, obj: Any):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer): 
+            return int(obj)
+        if isinstance(obj, np.floating): 
+            return float(obj)
+        if isinstance(obj, np.ndarray): 
+            return obj.tolist()
+        return super().default(obj)
+
+# -------------------- String Cleaning & ICD-9 Formatting --------------------
+def _strip(x: str) -> str:
+    return re.sub(r"\s+", "", str(x or "")).upper().rstrip(".")
+
+def _clean_str(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and np.isnan(x):
+        return ""
+    s = str(x)
+    if s.lower() == "nan":
+        return ""
+    return s
+
+def format_icd9_dx(code: str) -> str:
+    c = _strip(code)
+    if not c:
+        return ""
+    if c[0].isdigit():
+        return c[:3] + "." + c[3:] if len(c) > 3 and "." not in c else c
+    if c[0] == "V":
+        return c[:3] + "." + c[3:] if len(c) > 3 and "." not in c else c
+    if c[0] == "E":
+        return c[:4] + "." + c[4:] if len(c) > 4 and "." not in c else c
+    return c
+
+def format_icd9_proc(code: str) -> str:
+    c = _strip(code)
+    if c.startswith("PRO_"):
+        c = c[4:]
+    if not c:
+        return ""
+    if c[0].isdigit():
+        return c[:2] + "." + c[2:] if len(c) > 2 and "." not in c else c
+    return c
+
+_dx_pat = re.compile(r"^(?:\d{3}(\.\d{1,2})?|V\d{2}(\.\d{1,2})?|E\d{3}(\.\d)?)$", re.I)
+_proc_pat = re.compile(r"^\d{2}(?:\.\d{1,2})?$")
+
+def is_icd9_dx(code: str) -> bool:
+    c = _strip(code)
+    return bool(_dx_pat.match(c)) and not bool(_proc_pat.match(c))
+
+def is_icd9_proc(code: str) -> bool:
+    c = _strip(code)
+    return bool(_proc_pat.match(c))
+
+def dx_aliases(k: str) -> Set[str]:
+    """Generate lookup aliases for ICD-9 DX."""
+    out = set()
+    k = _strip(k)
+    if not k:
+        return out
+    out.add(k)
+    out.add(k.replace('.', ''))  # no-dot
+    # *.00 -> *.0 (add both)
+    if k[0].isdigit() and re.match(r'^\d{3}\.\d{2}$', k) and k.endswith('0'):
+        out.add(k[:-1])
+        out.add(k[:-1].replace('.', ''))
+    # E***.x -> E**** (no-dot)
+    if k.startswith('E') and '.' in k and len(k.split('.')[-1]) == 1:
+        out.add(k.replace('.', ''))
+    return out
+
+def proc_aliases(k: str) -> Set[str]:
+    """Lookup aliases for procedures (dot and no-dot)."""
+    out = set()
+    k = _strip(k)
+    if not k:
+        return out
+    out.add(k)
+    out.add(k.replace('.', ''))
+    return out
+
+# -------------------- ICD-9 Range Parsing --------------------
+def parse_icd9_key(code: str) -> Tuple[str, int, int]:
+    """Parse ICD-9 code into category and numeric key for range matching."""
+    c = _strip(code)
+    if is_icd9_proc(c):
+        whole, frac = (c.split('.') + [""])[0], (c.split('.') + [""])[1]
+        frac = (frac + "00")[:2]
+        return ("PROC", int(whole) * 100 + int(frac or "0"), 100)
+    if c.startswith("E"):
+        base = c[1:]
+        parts = base.split('.')
+        whole, frac = parts[0], (parts[1] if len(parts) > 1 else "")
+        frac = (frac + "0")[:1]
+        return ("DX_E", int(whole) * 10 + int(frac or "0"), 10)
+    # numeric or V
+    base = c[1:] if c.startswith("V") else c
+    parts = base.split('.')
+    whole, frac = parts[0], (parts[1] if len(parts) > 1 else "")
+    frac = (frac + "00")[:2]
+    return ("DX_NUMV", int(whole) * 100 + int(frac or "0"), 100)
+
+def expand_json_spec_to_matcher(spec: str):
+    """Convert JSON specification to matcher for range or exact matching."""
+    s = _strip(spec)
+    if "-" in s:
+        left, right = s.split("-", 1)
+        def norm(ep):
+            dx = format_icd9_dx(ep)
+            pr = format_icd9_proc(ep)
+            if is_icd9_dx(dx):
+                return parse_icd9_key(dx)
+            if is_icd9_proc(pr):
+                return parse_icd9_key(pr)
+            return parse_icd9_key(ep)
+        return ('range', norm(left), norm(right))
+    else:
+        dx = format_icd9_dx(s)
+        pr = format_icd9_proc(s)
+        if is_icd9_dx(dx):
+            return ('exact', dx)
+        if is_icd9_proc(pr):
+            return ('exact', pr)
+        return ('exact', s)
+
+def code_in_range(code: str, start_key, end_key) -> bool:
+    """Check if code falls within range defined by start_key and end_key."""
+    cat_c, val_c, _ = parse_icd9_key(code)
+    cat_s, val_s, _ = start_key
+    cat_e, val_e, _ = end_key
+    if cat_s != cat_e or cat_c != cat_s:
+        return False
+    return val_s <= val_c <= val_e
+
+# -------------------- Master List Loaders --------------------
+def load_icd9_master_list(icd9_pkl: str, log) -> Set[str]:
+    """Load ICD-9 DX master list from pickle file."""
+    log(f"Loading ICD-9 DX master list: {icd9_pkl}")
+    obj = pickle.load(open(icd9_pkl, "rb"))
+    if isinstance(obj, pd.DataFrame):
+        col = 'icd_code' if 'icd_code' in obj.columns else obj.columns[0]
+        values = obj[col].astype(str).tolist()
+    elif isinstance(obj, (list, tuple, np.ndarray, pd.Series)):
+        values = list(map(str, obj))
+    else:
+        raise ValueError("icd9.pkl must be a DataFrame or a list/array/Series of codes.")
+    
+    out = set()
+    for c in set(values):
+        fdx = format_icd9_dx(c)
+        if is_icd9_dx(fdx):
+            out.add(fdx)
+    log(f"Master DX codes loaded: {len(out):,}")
+    return out
+
+def load_icd9_proc_master_list(icd9proc_pkl: str, log) -> Set[str]:
+    """Load ICD-9 PROC master list from pickle file."""
+    log(f"Loading ICD-9 PROC master list: {icd9proc_pkl}")
+    obj = pickle.load(open(icd9proc_pkl, "rb"))
+    if isinstance(obj, pd.DataFrame):
+        col = 'icd_code' if 'icd_code' in obj.columns else obj.columns[0]
+        values = obj[col].astype(str).tolist()
+    elif isinstance(obj, (list, tuple, np.ndarray, pd.Series)):
+        values = list(map(str, obj))
+    else:
+        raise ValueError("icd9proc.pkl must be a DataFrame or a list/array/Series of codes.")
+    
+    out = set()
+    for c in set(values):
+        fpr = format_icd9_proc(c)
+        if is_icd9_proc(fpr):
+            out.add(fpr)
+    log(f"Master PROC codes loaded: {len(out):,}")
+    return out
+
+def load_dataset_codes(dataset_pkl: str, log) -> Tuple[Set[str], Set[str]]:
+    """Load dataset codes from pickle file."""
+    if not dataset_pkl:
+        return set(), set()
+    
+    log(f"Loading dataset codes: {dataset_pkl}")
+    df = pickle.load(open(dataset_pkl, "rb"))
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("dataset PKL must be a DataFrame.")
+    
+    dx_raw, pr_raw = [], []
+    if 'icd_code' in df.columns:
+        for x in df['icd_code']:
+            if isinstance(x, (list, tuple, np.ndarray, pd.Series)):
+                dx_raw.extend(map(str, x))
+    if 'pro_code' in df.columns:
+        for x in df['pro_code']:
+            if isinstance(x, (list, tuple, np.ndarray, pd.Series)):
+                pr_raw.extend(map(str, x))
+    
+    dx = set(format_icd9_dx(c) for c in dx_raw if format_icd9_dx(c))
+    pr = set(format_icd9_proc(c) for c in pr_raw if format_icd9_proc(c))
+    log(f"Dataset DX codes: {len(dx):,} | PROC codes: {len(pr):,}")
+    return dx, pr
+
+# -------------------- Reverse CUI->ICD9 Mapping --------------------
+def reverse_cui_to_icd9_separate(cui_to_codes: Dict[str, List[str]], 
+                                master_dx: Set[str], 
+                                master_pr: Set[str], 
+                                log):
+    """Create reverse mapping from CUI->codes JSON to code->CUI mappings."""
+    log("Creating reverse mappings from CUI->ICD9 JSON")
+    dx_map = defaultdict(set)
+    pr_map = defaultdict(set)
+    
+    compiled = {cui: [expand_json_spec_to_matcher(s) for s in specs]
+                for cui, specs in cui_to_codes.items()}
+
+    for cui, specs in tqdm(compiled.items(), desc="Reversing CUI->ICD9 (DX/PROC)"):
+        exact_dx, exact_pr, ranges = [], [], []
+        for kind, *rest in specs:
+            if kind == 'exact':
+                code = rest[0]
+                if is_icd9_proc(code):
+                    exact_pr.append(code)
+                elif is_icd9_dx(code):
+                    exact_dx.append(code)
+            else:
+                ranges.append(tuple(rest))
+        
+        # Handle exact matches
+        for code in exact_dx:
+            if code in master_dx:
+                dx_map[code].add(cui)
+        for code in exact_pr:
+            if code in master_pr:
+                pr_map[code].add(cui)
+        
+        # Handle ranges
+        for (start_key, end_key) in ranges:
+            cat = start_key[0]
+            pool = master_pr if cat == "PROC" else master_dx
+            for code in pool:
+                if code_in_range(code, start_key, end_key):
+                    (pr_map if cat == "PROC" else dx_map)[code].add(cui)
+
+    dx_final = {k: sorted(v) for k, v in dx_map.items()}
+    pr_final = {k: sorted(v) for k, v in pr_map.items()}
+    
+    log(f"ICD-9 DX->CUI mappings: {len(dx_final):,}")
+    log(f"ICD-9 PROC->CUI mappings: {len(pr_final):,}")
+    
+    return dx_final, pr_final
+
+# -------------------- MRCONSO Streaming --------------------
+def read_conso_subset(path: str, usecols_idx: List[int], chunksize: int):
+    """Robust MRCONSO reader with error handling."""
+    return pd.read_csv(
+        path,
+        sep='|',
+        header=None,
+        usecols=usecols_idx,
+        dtype=str,
+        chunksize=chunksize,
+        quoting=csv.QUOTE_NONE,
+        on_bad_lines='skip',
+        low_memory=False
+    )
+
+def build_code2cui_generic(mrconso_path: str, target_sab: str, log, 
+                          keep_ts_p_only=True, chunksize=1_000_000):
+    """Build generic code->CUI mapping from MRCONSO for ATC, LOINC, SNOMEDCT_US."""
+    code2cuis = defaultdict(set)
+    code2name = {}
+    
+    for ch in tqdm(read_conso_subset(mrconso_path, USECOLS_IDX, chunksize), 
+                   desc=f"SAB={target_sab}", unit="chunk"):
+        ch.columns = USECOLS_MIN
+        ch = ch[(ch['LAT'] == 'ENG') & (ch['SAB'] == target_sab)]
+        ch = ch[(ch['SUPPRESS'] != 'O')]
+        
+        if keep_ts_p_only:
+            chp = ch[ch['TS'] == 'P']
+            if not chp.empty:
+                ch = chp
+        
+        if ch.empty:
+            continue
+            
+        for _, r in ch.iterrows():
+            code = _strip(_clean_str(r.get('CODE')))
+            if not code:
+                continue
+            cui = _clean_str(r.get('CUI'))
+            name = _clean_str(r.get('STR'))
+            if not cui:
+                continue
+            code2cuis[code].add(cui)
+            if code not in code2name:
+                code2name[code] = name
+    
+    code2cuis = {k: sorted(v) for k, v in code2cuis.items()}
+    log(f"[{target_sab}] codes: {len(code2cuis):,}")
+    return code2cuis, code2name
+
+# -------------------- Enhanced MRCONSO Loader for KG --------------------
+def load_mrconso_for_kg(mrconso_path: str, target_vocabs: List[str], 
+                       restrict_to_cuis: Set[str], log):
+    """
+    Load MRCONSO data for KG building with separate rows for each CUI-SAB-CODE combination.
+    Only includes target vocabularies to avoid noise.
+    """
+    log(f"Loading MRCONSO for KG (target vocabs: {target_vocabs})")
+    usecols_idx = [0, 1, 6, 11, 12, 13, 14]
+    colnames = ['CUI', 'LAT', 'ISPREF', 'SAB', 'TTY', 'CODE', 'STR']
+    
+    # First pass: collect preferred names per CUI
+    name_map = {}
+    tty_priority = {'PT': 0, 'PN': 1, 'FN': 2}
+    
+    it = pd.read_csv(
+        mrconso_path,
+        sep='|',
+        header=None,
+        usecols=usecols_idx,
+        dtype=str,
+        chunksize=1_000_000,
+        quoting=csv.QUOTE_NONE,
+        on_bad_lines='skip',
+        low_memory=False
+    )
+    
+    name_candidates = []
+    expanded_rows = []
+    
+    for ch in it:
+        ch.columns = colnames
+        ch = ch[(ch['LAT'] == 'ENG') & (ch['SAB'].isin(target_vocabs))]
+        if restrict_to_cuis:
+            ch = ch[ch['CUI'].isin(restrict_to_cuis)]
+        if ch.empty:
+            continue
+        
+        # Clean data
+        ch['CUI'] = ch['CUI'].apply(_clean_str)
+        ch['SAB'] = ch['SAB'].apply(_clean_str)
+        ch['CODE'] = ch['CODE'].apply(_clean_str)
+        ch['STR'] = ch['STR'].apply(_clean_str)
+        ch['ISPREF'] = ch['ISPREF'].apply(_clean_str)
+        ch['TTY'] = ch['TTY'].apply(_clean_str)
+        
+        # Filter out empty codes and CUIs
+        ch = ch[(ch['CUI'] != '') & (ch['CODE'] != '') & (ch['STR'] != '')]
+        if ch.empty:
+            continue
+        
+        # Collect name candidates
+        ch['is_pref'] = ch['ISPREF'].apply(lambda x: 1 if x == 'Y' else 0)
+        ch['tty_rank'] = ch['TTY'].apply(lambda t: tty_priority.get(t, 99))
+        name_candidates.append(ch[['CUI', 'STR', 'is_pref', 'tty_rank']])
+        
+        # Collect expanded rows (one per CUI-SAB-CODE combination)
+        for _, row in ch.iterrows():
+            expanded_rows.append({
+                'cui': row['CUI'],
+                'sab': row['SAB'],
+                'code': row['CODE'],
+                'str': row['STR']
+            })
+    
+    # Select best names
+    if name_candidates:
+        all_names = pd.concat(name_candidates, ignore_index=True)
+        best_names = (all_names.sort_values(['CUI', 'is_pref', 'tty_rank'], ascending=[True, False, True])
+                     .drop_duplicates('CUI', keep='first'))
+        name_map = dict(zip(best_names['CUI'], best_names['STR']))
+    
+    # Create expanded DataFrame
+    expanded_df = pd.DataFrame(expanded_rows)
+    if not expanded_df.empty:
+        expanded_df['name'] = expanded_df['cui'].map(name_map)
+        # Remove duplicates
+        expanded_df = expanded_df.drop_duplicates(['cui', 'sab', 'code']).reset_index(drop=True)
+    
+    log(f"MRCONSO for KG: {len(expanded_df):,} CUI-SAB-CODE combinations")
+    log(f"Unique CUIs: {expanded_df['cui'].nunique():,}")
+    log(f"SAB distribution: {dict(expanded_df['sab'].value_counts())}")
+    
+    return expanded_df, name_map
+
+# -------------------- MRREL and MRSTY Loaders --------------------
+def load_mrrel_filtered(mrrel_path: str, allowed_sabs: List[str], 
+                       restrict_to_cuis: Set[str], log):
+    """Load MRREL relations filtered by vocabularies and CUIs."""
+    usecols_idx = [0, 3, 4, 7, 10]
+    colnames = ['CUI1', 'REL', 'CUI2', 'RELA', 'SAB']
+    out = []
+    
+    it = pd.read_csv(
+        mrrel_path,
+        sep='|',
+        header=None,
+        usecols=usecols_idx,
+        dtype=str,
+        chunksize=1_000_000,
+        quoting=csv.QUOTE_NONE,
+        on_bad_lines='skip',
+        low_memory=False
+    )
+    
+    for ch in it:
+        ch.columns = colnames
+        ch = ch[ch['SAB'].isin(allowed_sabs)]
+        if restrict_to_cuis:
+            ch = ch[ch['CUI1'].isin(restrict_to_cuis) | ch['CUI2'].isin(restrict_to_cuis)]
+        if not ch.empty:
+            out.append(ch)
+    
+    rel = pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=colnames)
+    log(f"MRREL filtered: {len(rel):,} (SAB∈{allowed_sabs})")
+    return rel
+
+def load_mrsty_for_cuis(mrsty_path: str, cuis: Set[str], log):
+    """Load semantic types for specified CUIs."""
+    usecols_idx = [0, 3]  # CUI, STY
+    colnames = ['CUI', 'STY']
+    
+    it = pd.read_csv(
+        mrsty_path,
+        sep='|',
+        header=None,
+        usecols=usecols_idx,
+        dtype=str,
+        chunksize=500_000,
+        quoting=csv.QUOTE_NONE,
+        on_bad_lines='skip',
+        low_memory=False
+    )
+    
+    rows = []
+    for ch in it:
+        ch.columns = colnames
+        ch = ch[ch['CUI'].isin(cuis)]
+        if not ch.empty:
+            rows.append(ch)
+    
+    sty = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=colnames)
+    return sty.groupby('CUI')['STY'].apply(
+        lambda s: sorted(set(_clean_str(x) for x in s if _clean_str(x)))
+    ).to_dict()
+
+# -------------------- Knowledge Graph Builder --------------------
+def build_knowledge_graph(umls_dir: str, out_dir: str, code_mappings: Dict[str, Dict], 
+                         target_vocabs: List[str], log):
+    """Build comprehensive knowledge graph from all code mappings."""
+    
+    mrconso = os.path.join(umls_dir, "MRCONSO.RRF")
+    mrrel = os.path.join(umls_dir, "MRREL.RRF")
+    mrsty = os.path.join(umls_dir, "MRSTY.RRF")
+    
+    for p in (mrconso, mrrel, mrsty):
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Missing {p}")
+
+    # Collect all CUIs from mappings
+    seed_cuis = set()
+    for mapping in code_mappings.values():
+        for cui_list in mapping.values():
+            seed_cuis.update(cui_list)
+    log(f"Seed CUIs from all mappings: {len(seed_cuis):,}")
+
+    # Load MRCONSO data for KG (expanded format)
+    conso_df, name_map = load_mrconso_for_kg(mrconso, target_vocabs, seed_cuis, log)
+    
+    # Load relations and semantic types
+    rel_df = load_mrrel_filtered(mrrel, allowed_sabs=target_vocabs, 
+                                restrict_to_cuis=seed_cuis, log=log)
+    rel_df = rel_df[(rel_df['CUI1'].isin(seed_cuis)) & 
+                    (rel_df['CUI2'].isin(seed_cuis))].reset_index(drop=True)
+    sty_map = load_mrsty_for_cuis(mrsty, seed_cuis, log)
+
+    # Build NetworkX graph
+    G = nx.DiGraph()
+    log("Adding nodes to graph...")
+    
+    # Aggregate data per CUI for NetworkX graph
+    cui_sabs = defaultdict(set)
+    cui_codes = defaultdict(set)
+    for _, row in conso_df.iterrows():
+        cui = row['cui']
+        cui_sabs[cui].add(row['sab'])
+        cui_codes[cui].add(row['code'])
+    
+    for cui in tqdm(seed_cuis, desc="Nodes"):
+        G.add_node(cui,
+                   name=name_map.get(cui, "Unknown"),
+                   sab=sorted(cui_sabs.get(cui, [])),
+                   code=sorted(cui_codes.get(cui, [])),
+                   semantic_type=sty_map.get(cui, []))
+
+    log("Adding edges to graph...")
+    for _, r in tqdm(rel_df.iterrows(), total=len(rel_df), desc="Edges"):
+        u, v = _clean_str(r.get('CUI1')), _clean_str(r.get('CUI2'))
+        if u in G and v in G:
+            G.add_edge(u, v,
+                       rel=_clean_str(r.get('REL')),
+                       rela=_clean_str(r.get('RELA')),
+                       sab_relation=_clean_str(r.get('SAB')))
+
+    log(f"Graph built: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+
+    # Save CSV files (using expanded format)
+    save_graph_csvs_expanded(G, conso_df, out_dir, log)
+    
+    # Save graph files
+    save_graph_files(G, out_dir, log)
+    
+    return G, conso_df
+
+def save_graph_csvs_expanded(G: nx.DiGraph, conso_df: pd.DataFrame, out_dir: str, log):
+    """
+    Save nodes and edges as CSV files.
+    Nodes CSV uses expanded format: one row per CUI-SAB-CODE combination.
+    Edges CSV uses expanded format: separate rows for each vocabulary combination.
+    """
+    
+    # Nodes CSV - Expanded format (one row per CUI-SAB-CODE combination)
+    nodes_data = []
+    for _, row in conso_df.iterrows():
+        cui = row['cui']
+        if cui in G:  # Only include CUIs that are in our graph
+            nodes_data.append({
+                'cui': cui,
+                'name': row['name'] if pd.notna(row['name']) else '',
+                'sab': row['sab'],  # Single SAB per row
+                'code': row['code'],  # Single CODE per row
+                'semantic_type': '|'.join(G.nodes[cui].get('semantic_type', []))
+            })
+    
+    nodes_df = pd.DataFrame(nodes_data)
+    nodes_path = os.path.join(out_dir, 'kg_nodes.csv')
+    nodes_df.to_csv(nodes_path, index=False)
+    log(f"Saved nodes (expanded): {len(nodes_df):,} rows -> {nodes_path}")
+    log(f"Unique SABs in nodes: {sorted(nodes_df['sab'].unique())}")
+    
+    # Also save aggregated nodes for reference
+    nodes_agg_data = []
+    for cui, data in G.nodes(data=True):
+        nodes_agg_data.append({
+            'cui': cui,
+            'name': data.get('name', ''),
+            'sab': '|'.join(data.get('sab', [])),
+            'code': '|'.join(data.get('code', [])),
+            'semantic_type': '|'.join(data.get('semantic_type', []))
+        })
+    
+    nodes_agg_df = pd.DataFrame(nodes_agg_data)
+    nodes_agg_path = os.path.join(out_dir, 'kg_nodes_aggregated.csv')
+    nodes_agg_df.to_csv(nodes_agg_path, index=False)
+    log(f"Saved nodes (aggregated): {len(nodes_agg_df):,} rows -> {nodes_agg_path}")
+    
+    # Edges CSV - Expanded format (separate rows for each vocabulary combination)
+    log("Creating expanded edges CSV...")
+    edges_data = []
+    
+    # Create lookup for CUI -> SABs from the expanded nodes
+    cui_to_sabs = defaultdict(set)
+    for _, row in conso_df.iterrows():
+        cui_to_sabs[row['cui']].add(row['sab'])
+    
+    # Create lookup for CUI -> codes from the expanded nodes  
+    cui_to_codes = defaultdict(set)
+    for _, row in conso_df.iterrows():
+        cui_to_codes[row['cui']].add(row['code'])
+    
+    for u, v, data in tqdm(G.edges(data=True), desc="Expanding edges"):
+        # Get SABs for source and target CUIs
+        start_sabs = sorted(cui_to_sabs.get(u, set()))
+        target_sabs = sorted(cui_to_sabs.get(v, set()))
+        
+        # Get codes for source and target CUIs
+        start_codes = sorted(cui_to_codes.get(u, set()))
+        target_codes = sorted(cui_to_codes.get(v, set()))
+        
+        # Create cartesian product of SAB combinations
+        for start_sab in start_sabs:
+            for target_sab in target_sabs:
+                edges_data.append({
+                    'cui_start': u,
+                    'name_start': G.nodes[u].get('name', ''),
+                    'sab_start': start_sab,  # Single SAB per row
+                    'codes_start': '|'.join(start_codes),  # All codes for this CUI
+                    'rel': data.get('rel', ''),
+                    'rela': data.get('rela', ''),
+                    'sab_relation': data.get('sab_relation', ''),
+                    'cui_target': v,
+                    'name_target': G.nodes[v].get('name', ''),
+                    'sab_target': target_sab,  # Single SAB per row
+                    'codes_target': '|'.join(target_codes)  # All codes for this CUI
+                })
+    
+    edges_df = pd.DataFrame(edges_data)
+    edges_path = os.path.join(out_dir, 'kg_edges.csv')
+    edges_df.to_csv(edges_path, index=False)
+    log(f"Saved edges (expanded): {len(edges_df):,} -> {edges_path}")
+    log(f"Unique SABs in edge starts: {sorted(edges_df['sab_start'].unique())}")
+    log(f"Unique SABs in edge targets: {sorted(edges_df['sab_target'].unique())}")
+
+def save_graph_files(G: nx.DiGraph, out_dir: str, log):
+    """Save graph in GraphML and pickle formats."""
+    
+    # Convert for GraphML (requires string attributes)
+    G_ml = nx.DiGraph()
+    for n, data in G.nodes(data=True):
+        data_str = {}
+        for k, v in data.items():
+            if isinstance(v, list):
+                data_str[k] = '|'.join(map(str, v))
+            else:
+                data_str[k] = '' if v is None else str(v)
+        G_ml.add_node(n, **data_str)
+    
+    for u, v, data in G.edges(data=True):
+        data_str = {k: ('' if v is None else str(v)) for k, v in data.items()}
+        G_ml.add_edge(u, v, **data_str)
+    
+    # Save files
+    graphml_path = os.path.join(out_dir, 'medical_knowledge_graph.graphml')
+    pickle_path = os.path.join(out_dir, 'medical_knowledge_graph.pkl')
+    
+    nx.write_graphml(G_ml, graphml_path)
+    dump_pickle(pickle_path, G)
+    
+    log(f"Saved GraphML: {graphml_path}")
+    log(f"Saved pickle: {pickle_path}")
+
+# -------------------- Coverage Analysis --------------------
+def coverage_analysis(all_codes: Set[str], mapping: Dict[str, List[str]]):
+    """Analyze coverage of codes in mapping."""
+    have = {c for c in all_codes if c in mapping}
+    miss = sorted(all_codes - have)
+    pct = 100.0 * len(have) / max(1, len(all_codes))
+    return {
+        "total": len(all_codes),
+        "mapped": len(have),
+        "missing": len(miss),
+        "coverage_pct": pct,
+        "missing_sample": miss[:25]
+    }
+
+# -------------------- Statistics and Visualization --------------------
+def generate_statistics(G: nx.DiGraph, code_mappings: Dict, conso_df: pd.DataFrame, out_dir: str, log):
+    """Generate comprehensive statistics."""
+    
+    degrees = [d for _, d in G.degree()]
+    
+    stats = {
+        'graph': {
+            'num_nodes': G.number_of_nodes(),
+            'num_edges': G.number_of_edges(),
+            'avg_degree': float(np.mean(degrees)) if degrees else 0.0,
+            'median_degree': float(np.median(degrees)) if degrees else 0.0,
+            'max_degree': int(np.max(degrees)) if degrees else 0,
+            'min_degree': int(np.min(degrees)) if degrees else 0,
+        },
+        'vocabularies': {k: len(v) for k, v in code_mappings.items()},
+        'components': len(list(nx.weakly_connected_components(G))),
+        'sab_distribution': dict(conso_df['sab'].value_counts()) if not conso_df.empty else {}
+    }
+    
+    # Semantic types
+    sty_counts = defaultdict(int)
+    for _, data in G.nodes(data=True):
+        stys = data.get('semantic_type', [])
+        for sty in stys:
+            if sty:
+                sty_counts[sty] += 1
+    stats['semantic_types'] = dict(sorted(sty_counts.items(), key=lambda x: x[1], reverse=True)[:20])
+    
+    # Relationships
+    rel_counts = defaultdict(int)
+    for _, _, data in G.edges(data=True):
+        rel_counts[data.get('rel', 'Unknown') or 'Unknown'] += 1
+    stats['relationships'] = dict(sorted(rel_counts.items(), key=lambda x: x[1], reverse=True))
+    
+    # Save statistics
+    stats_path = os.path.join(out_dir, 'kg_statistics.json')
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2, cls=NumpyEncoder)
+    
+    log(f"Statistics saved: {stats_path}")
+    return stats
+
+# -------------------- Main Function --------------------
+def main():
+    parser = argparse.ArgumentParser(description="Build comprehensive UMLS KG with clean vocabulary filtering")
+    parser.add_argument("--umls-dir", default=UMLS_DIR, help="UMLS META directory")
+    parser.add_argument("--out-dir", default=OUTPUT_DIR, help="Output directory")
+    parser.add_argument("--cui-to-icd9-json", required=True, help="CUI -> [codes and/or ranges] JSON file")
+    parser.add_argument("--icd9-dx-pkl", required=True, help="Master diagnosis list (icd9.pkl)")
+    parser.add_argument("--icd9-proc-pkl", required=True, help="Master procedure list (icd9proc.pkl)")
+    parser.add_argument("--dataset-pkl", default="", help="Dataset codes pickle (optional)")
+    parser.add_argument("--with-names", action="store_true", help="Include name mappings")
+    parser.add_argument("--target-vocabs", default="ICD9CM,LNC,ATC,SNOMEDCT_US", help="Target vocabularies")
+    parser.add_argument("--chunksize", type=int, default=1_000_000, help="Chunk size for processing")
+    
+    args = parser.parse_args()
+    
+    # Setup
+    ensure_dir(args.out_dir)
+    ensure_dir(os.path.join(args.out_dir, 'visualizations'))
+    log = make_logger(args.out_dir)
+    
+    target_vocabs = [s.strip() for s in args.target_vocabs.split(",") if s.strip()]
+    mrconso_path = os.path.join(args.umls_dir, 'MRCONSO.RRF')
+    
+    log("Starting comprehensive UMLS processing with clean vocabulary filtering...")
+    log(f"Target vocabularies: {target_vocabs}")
+    
+    # Step 1: Load master ICD-9 lists
+    master_dx = load_icd9_master_list(args.icd9_dx_pkl, log)
+    master_pr = load_icd9_proc_master_list(args.icd9_proc_pkl, log)
+    
+    # Step 2: Load dataset codes (optional)
+    ds_dx, ds_pr = set(), set()
+    if args.dataset_pkl:
+        ds_dx, ds_pr = load_dataset_codes(args.dataset_pkl, log)
+    
+    # Step 3: Create ICD-9 mappings from JSON
+    log(f"Reading CUI->ICD9 JSON: {args.cui_to_icd9_json}")
+    cui_to_codes = json.load(open(args.cui_to_icd9_json, "r"))
+    icd9_dx_map, icd9_pr_map = reverse_cui_to_icd9_separate(
+        cui_to_codes, master_dx, master_pr, log)
+    
+    # Step 4: Build other vocabulary mappings
+    code_mappings = {}
+    
+    # ATC
+    log("Building ATC -> CUI mapping...")
+    atc_map, atc_names = build_code2cui_generic(
+        mrconso_path, "ATC", log, keep_ts_p_only=True, chunksize=args.chunksize)
+    code_mappings['atc'] = atc_map
+    
+    # LOINC
+    log("Building LOINC -> CUI mapping...")
+    loinc_map, loinc_names = build_code2cui_generic(
+        mrconso_path, "LNC", log, keep_ts_p_only=True, chunksize=args.chunksize)
+    code_mappings['loinc'] = loinc_map
+    
+    # SNOMEDCT_US
+    log("Building SNOMEDCT_US -> CUI mapping...")
+    snomed_map, snomed_names = build_code2cui_generic(
+        mrconso_path, "SNOMEDCT_US", log, keep_ts_p_only=True, chunksize=args.chunksize)
+    code_mappings['snomedct_us'] = snomed_map
+    
+    # Add ICD-9 mappings
+    code_mappings['icd9_dx'] = icd9_dx_map
+    code_mappings['icd9_proc'] = icd9_pr_map
+    
+    # Step 5: Save all mappings
+    dump_pickle(os.path.join(args.out_dir, "code2cui_icd9_dx.pkl"), icd9_dx_map)
+    dump_pickle(os.path.join(args.out_dir, "code2cui_icd9_proc.pkl"), icd9_pr_map)
+    dump_pickle(os.path.join(args.out_dir, "code2cui_atc.pkl"), atc_map)
+    dump_pickle(os.path.join(args.out_dir, "code2cui_loinc.pkl"), loinc_map)
+    dump_pickle(os.path.join(args.out_dir, "code2cui_snomedct_us.pkl"), snomed_map)
+    
+    # Create alias mappings for ICD-9
+    alias2canon_dx = {}
+    alias2canon_pr = {}
+    for code in icd9_dx_map.keys():
+        for alias in dx_aliases(code):
+            alias2canon_dx.setdefault(alias, code)
+    for code in icd9_pr_map.keys():
+        for alias in proc_aliases(code):
+            alias2canon_pr.setdefault(alias, code)
+    
+    dump_pickle(os.path.join(args.out_dir, "alias2canon_icd9_dx.pkl"), alias2canon_dx)
+    dump_pickle(os.path.join(args.out_dir, "alias2canon_icd9_proc.pkl"), alias2canon_pr)
+    
+    # Save names if requested
+    if args.with_names:
+        dump_pickle(os.path.join(args.out_dir, "code2name_atc.pkl"), atc_names)
+        dump_pickle(os.path.join(args.out_dir, "code2name_loinc.pkl"), loinc_names)
+        dump_pickle(os.path.join(args.out_dir, "code2name_snomedct_us.pkl"), snomed_names)
+    
+    # Step 6: Coverage analysis
+    coverage_stats = {
+        "master_dx": coverage_analysis(master_dx, icd9_dx_map),
+        "master_proc": coverage_analysis(master_pr, icd9_pr_map),
+        "dataset_dx": coverage_analysis(ds_dx, icd9_dx_map) if ds_dx else {},
+        "dataset_proc": coverage_analysis(ds_pr, icd9_pr_map) if ds_pr else {}
+    }
+    
+    with open(os.path.join(args.out_dir, "coverage_analysis.json"), "w") as f:
+        json.dump(coverage_stats, f, indent=2, cls=NumpyEncoder)
+    log("Coverage analysis saved")
+    
+    # Step 7: Build knowledge graph
+    log("Building comprehensive knowledge graph with clean vocabulary filtering...")
+    G, conso_df = build_knowledge_graph(
+        umls_dir=args.umls_dir,
+        out_dir=args.out_dir,
+        code_mappings=code_mappings,
+        target_vocabs=target_vocabs,
+        log=log
+    )
+    
+    # Step 8: Generate statistics
+    log("Generating comprehensive statistics...")
+    stats = generate_statistics(G, code_mappings, conso_df, args.out_dir, log)
+    
+    # Step 9: Final summary
+    summary = {
+        'vocabulary_counts': {k: len(v) for k, v in code_mappings.items()},
+        'graph_stats': stats['graph'],
+        'total_unique_codes': sum(len(v) for v in code_mappings.values()),
+        'coverage_stats': coverage_stats,
+        'target_vocabularies': target_vocabs,
+        'sab_distribution': stats.get('sab_distribution', {})
+    }
+    
+    summary_path = os.path.join(args.out_dir, 'comprehensive_build_summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2, cls=NumpyEncoder)
+    
+    log("\n=== COMPREHENSIVE SUMMARY ===")
+    log(f"Vocabulary mappings built:")
+    for vocab, mapping in code_mappings.items():
+        log(f"  {vocab.upper()}: {len(mapping):,} codes")
+    log(f"Knowledge Graph: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+    log(f"Total unique codes across all vocabularies: {summary['total_unique_codes']:,}")
+    log(f"SAB distribution in final KG: {stats.get('sab_distribution', {})}")
+    log(f"Coverage:")
+    for coverage_type, cov_data in coverage_stats.items():
+        if cov_data:
+            log(f"  {coverage_type}: {cov_data['coverage_pct']:.1f}% ({cov_data['mapped']}/{cov_data['total']})")
+    log(f"Output directory: {args.out_dir}")
+    log("Comprehensive build completed successfully!")
+
+if __name__ == "__main__":
+    main()

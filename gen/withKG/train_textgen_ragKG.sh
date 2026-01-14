@@ -8,14 +8,7 @@
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/Textgen-withKG-withRAG/train_textgen_rag_%j.out
 
-### ============================================================================
-### SLURM SETTINGS
-### ============================================================================
-# --gres=gpu:3          → Use 3 GPUs (change to 1 for single GPU)
-# --cpus-per-task=16    → 16 CPUs total (distributes across GPUs)
-# --mem=128G            → Total memory (adjust based on GPU count)
-# --time=24:00:00       → Max runtime (adjust as needed)
-### ============================================================================
+set -e
 
 ### 1) Modules
 module purge
@@ -49,88 +42,88 @@ echo "[INFO] Using ${GPUS} GPU(s) for training"
 SCRIPT=gen/withKG/train_textgen_ragKG.py
 echo "[INFO] Training Script: ${SCRIPT}"
 
-### ============================================================================
-### 5) CONFIGURATION - EDIT THIS SECTION
-### ============================================================================
-
-# Choose dataset mode: "baseline", "rag_unweighted", or "rag_weighted"
-# MODE="baseline"
+# Choose dataset mode: "rag_unweighted", or "rag_weighted"
 MODE="rag_unweighted"
 # MODE="rag_weighted"
 
-echo "[INFO] Selected MODE: ${MODE}"
+# Path config for H1/H2
+H1=true
+H2=false
+COMBINED=false
 
-# Base model
-# BASE_LLM=meta-llama/Llama-3.2-1B-Instruct
+BASE_LLM=meta-llama/Llama-3.2-1B-Instruct
 # BASE_LLM=models/Llama-3.1-8B-Instruct
-BASE_LLM=models/Meditron3-8B
+# BASE_LLM=models/Meditron3-8B
 echo "[INFO] Using base LLM: ${BASE_LLM}"
+
 if [ "$BASE_LLM" = "models/Llama-3.1-8B-Instruct" ]; then
-    echo "[INFO] Using Llama-3.1-8B model"
     LLM="llama3.1-8B"
 elif [ "$BASE_LLM" = "meta-llama/Llama-3.2-1B-Instruct" ]; then
-    echo "[INFO] Using Llama-3.2-1B model"
     LLM="llama3.2-1B"
 elif [ "$BASE_LLM" = "models/Meditron3-8B" ]; then
-    echo "[INFO] Using Meditron3-8B model"
     LLM="Meditron3-8B"
 else
-    echo "[WARNING] Base LLM is not configured"
+    LLM="unknown"
 fi
 
-# Training parameters
 EPOCHS=10
 
-### ============================================================================
-### TOKEN BUDGETS - CONFIGURED PER MODE
-### ============================================================================
-
-if [ "$MODE" = "baseline" ]; then
-    # BASELINE: No KG facts
-    TRAIN_JSONL=dataset/preprocessed_rag_62k/train_rag_unweighted.jsonl  
-    VAL_JSONL=dataset/preprocessed_rag_62k/val_rag_unweighted.jsonl  
-    OUT_DIR=runs_textgen_rag/${MODE}/${LLM}/baseline_checkpoints_$EPOCHS
-    ADAPTER_DIR=runs_textgen_rag/${MODE}/${LLM}/baseline_adapter_$EPOCHS
-    EXP_NAME="baseline"
-    
-    # Token budgets - SAME total as RAG for fair comparison
-    MAX_LEN=5120
-    MAX_PROMPT_TOKENS=4572      # 3072 + 1500 (absorbs KG space)
-    MAX_KG_TOKENS=0             # No KG facts (Removes [KNOWLEDGE GRAPH FACTS] section)
-    MAX_TARGET_TOKENS=512       # Diagnosis output
-    
-elif [ "$MODE" = "rag_unweighted" ]; then
-    # RAG UNWEIGHTED: With unweighted KG facts
-    TRAIN_JSONL=dataset/preprocessed_rag_62k/train_rag_unweighted.jsonl
-    VAL_JSONL=dataset/preprocessed_rag_62k/val_rag_unweighted.jsonl
-    OUT_DIR=runs_textgen_rag/${MODE}/${LLM}/rag_unweighted_checkpoints_$EPOCHS
-    ADAPTER_DIR=runs_textgen_rag/${MODE}/${LLM}/rag_unweighted_adapter_$EPOCHS
+# Set data directory and output directory structure
+if [ "$MODE" = "rag_unweighted" ]; then
+    # Path config selection for RAG modes
+    if [ "$H1" = true ] && [ "$H2" = false ] && [ "$COMBINED" = false ]; then
+        path_config="h1"
+    elif [ "$H1" = false ] && [ "$H2" = true ] && [ "$COMBINED" = false ]; then
+        path_config="h2"
+    elif [ "$H1" = false ] && [ "$H2" = false ] && [ "$COMBINED" = true ]; then
+        path_config="combined"
+    else
+        echo "[ERROR] Invalid path configuration for rag_unweighted mode."
+        exit 1
+    fi
+    DATA_PARENT_DIR=dataset/preprocessed_rag_full/map_desc/${path_config}/unweighted
+    OUT_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_unweighted_checkpoints_$EPOCHS
+    ADAPTER_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_unweighted_adapter_$EPOCHS
     EXP_NAME="rag_unweighted"
-    
-    # Token budgets
-    MAX_LEN=5120
-    MAX_PROMPT_TOKENS=3072      # Clinical notes + instructions
-    MAX_KG_TOKENS=1500          # Knowledge graph facts (based on data median)
-    MAX_TARGET_TOKENS=512       # Diagnosis output
-    
 elif [ "$MODE" = "rag_weighted" ]; then
-    # RAG WEIGHTED: With weighted KG facts (alpha=0.3)
-    TRAIN_JSONL=dataset/preprocessed_rag_62k/train_rag_weighted_alpha0.3.jsonl
-    VAL_JSONL=dataset/preprocessed_rag_62k/val_rag_weighted_alpha0.3.jsonl
-    OUT_DIR=runs_textgen_rag/${MODE}/${LLM}/rag_weighted_checkpoints_$EPOCHS
-    ADAPTER_DIR=runs_textgen_rag/${MODE}/${LLM}/rag_weighted_adapter_$EPOCHS
+    # Path config selection for RAG modes
+    if [ "$H1" = true ] && [ "$H2" = false ] && [ "$COMBINED" = false ]; then
+        path_config="h1"
+    elif [ "$H1" = false ] && [ "$H2" = true ] && [ "$COMBINED" = false ]; then
+        path_config="h2"
+    elif [ "$H1" = false ] && [ "$H2" = false ] && [ "$COMBINED" = true ]; then
+        path_config="combined"
+    else
+        echo "[ERROR] Invalid path configuration for rag_weighted mode."
+        exit 1
+    fi
+    DATA_PARENT_DIR=dataset/preprocessed_rag_full/map_desc/${path_config}/weighted_alpha0.3
+    OUT_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_weighted_checkpoints_$EPOCHS
+    ADAPTER_DIR=runs_textgen_rag/${path_config}/${LLM}/rag_weighted_adapter_$EPOCHS
     EXP_NAME="rag_weighted_alpha0.3"
-    
-    # Token budgets (same as unweighted)
-    MAX_LEN=5120
-    MAX_PROMPT_TOKENS=3072      # Clinical notes + instructions
-    MAX_KG_TOKENS=1500          # Knowledge graph facts (weighted)
-    MAX_TARGET_TOKENS=512       # Diagnosis output
-    
 else
-    echo "[ERROR] Unknown MODE: $MODE"
-    echo "Valid options: baseline, rag_unweighted, rag_weighted"
+    echo "[ERROR] Unknown MODE: ${MODE}"
     exit 1
+fi
+
+echo "[INFO] Selected MODE: ${MODE}"
+echo "[INFO] Data parent dir: ${DATA_PARENT_DIR}"
+
+# Set train/val jsonl paths and token budgets
+if [ "$MODE" = "rag_unweighted" ]; then
+    TRAIN_JSONL=${DATA_PARENT_DIR}/train_rag_${path_config}_unweighted.jsonl
+    VAL_JSONL=${DATA_PARENT_DIR}/val_rag_${path_config}_unweighted.jsonl
+    MAX_LEN=5120
+    MAX_PROMPT_TOKENS=3072
+    MAX_KG_TOKENS=1500
+    MAX_TARGET_TOKENS=512
+elif [ "$MODE" = "rag_weighted" ]; then
+    TRAIN_JSONL=${DATA_PARENT_DIR}/train_rag_${path_config}_weighted_alpha0.3.jsonl
+    VAL_JSONL=${DATA_PARENT_DIR}/val_rag_${path_config}_weighted_alpha0.3.jsonl
+    MAX_LEN=5120
+    MAX_PROMPT_TOKENS=3072
+    MAX_KG_TOKENS=1500
+    MAX_TARGET_TOKENS=512
 fi
 
 # LoRA parameters
@@ -211,7 +204,6 @@ echo "[INFO] Launching training with torchrun..."
 echo "[INFO] Command: torchrun --standalone --nproc_per_node=${GPUS}"
 echo ""
 
-# Run with torchrun for DDP (works for single GPU too)
 srun torchrun \
   --standalone \
   --nproc_per_node=${GPUS} \
@@ -237,9 +229,8 @@ srun torchrun \
   --save_adapter \
   --adapter_dir "${ADAPTER_DIR}" \
   --experiment_name "${EXP_NAME}" \
-  --early_stop 1 \
+  --early_stop 0 \
   --patience 2 \
-  --seed 42
 
 status=$?
 end=$(date +%s)
